@@ -182,22 +182,22 @@ class BesoModel(nn.Module):
             global_cond_dim += clip_text_dim
 
         self.dit_backbone = Noise_Dec_only(
-            state_dim=global_cond_dim * 2, ## hard defined
+            state_dim=global_cond_dim,
             action_dim=self.config.action_feature.shape[0],
             goal_dim=0,
-            device="cuda",  # Default device, will be moved to correct device automatically by PyTorch
+            device="cpu",  # Default device, will be moved to correct device automatically by PyTorch
             goal_conditioned=False,
             embed_dim=config.embed_dim,
             embed_pdrob=0,
             goal_seq_len=0,
-            obs_seq_len=self.config.n_obs_steps, ## should be 1
+            obs_seq_len=self.config.n_obs_steps, 
             action_seq_len=self.config.horizon,
             # linear_output=False,
             use_ada_conditioning=False,
             diffusion_type="beso",  # ddpm, beso or rf,
-            use_pos_emb=False,
+            use_pos_emb=True,
         )
-        self.device = "cuda"
+        self.device = None
 
         # Print parameter counts
         def count_params(module):
@@ -271,7 +271,7 @@ class BesoModel(nn.Module):
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         ## no goal input here
         ## 1) state as-is (FIX) can be wrong 
-        state_feats = torch.zeros_like(batch[OBS_STATE])  # (B, S, state_dim)
+        state_feats = batch[OBS_STATE]  # (B, S, state_dim)
 
         global_cond_feats = [state_feats]
 
@@ -349,7 +349,7 @@ class BesoModel(nn.Module):
                 text_features = text_outputs.unsqueeze(1).expand(-1, n_obs_steps, -1)
                 global_cond_feats.append(text_features)
 
-        feats = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1).unsqueeze(1)
+        feats = torch.cat(global_cond_feats, dim=-1)
 
         return feats
 
@@ -357,7 +357,7 @@ class BesoModel(nn.Module):
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, S，global_cond_dim)
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond)
         # Extract `n_action_steps` steps worth of actions (from the current observation).
@@ -384,12 +384,16 @@ class BesoModel(nn.Module):
         # Sample noise to add to the trajectory.
         noise = torch.randn(trajectory.shape, device=trajectory.device)
         # Sample a random noising timestep for each item in the batch.
+        device = trajectory.device
+
         sigmas = make_sample_density(
             self.config.sigma_sample_density_type,
             self.config.sigma_max,
             self.config.sigma_min,
-        )(shape=(len(trajectory),), device=self.device).to(self.device)
-        # ->
+        )(
+            shape=(len(trajectory),),
+            device=device,
+        ).to(device)
 
         c_skip, c_out, c_in = [
             append_dims(x, trajectory.ndim) for x in self.get_scalings(sigmas)

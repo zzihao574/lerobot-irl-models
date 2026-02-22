@@ -305,30 +305,39 @@ class Noise_Dec_only(nn.Module):
     ):
         super().__init__()
 
+        self.device = device
+
+        # Mainly used for language condition or goal image condition
+        self.goal_conditioned = goal_conditioned
+        if not goal_conditioned:
+            goal_seq_len = 0
+
+        # Source DiffusionGPT sequence layout expects one state token and one action token per timestep.
+        if action_seq_len != obs_seq_len:
+            raise ValueError(
+                f"Source-style interleaved BESO expects action_seq_len == obs_seq_len, "
+                f"got {action_seq_len=} and {obs_seq_len=}"
+            )
+
+        # Source-style token counts:
+        # block_size = [sigma] + [goal_seq_len] + [2 * obs_seq_len]
+        self.block_size = goal_seq_len + 2 * obs_seq_len + 1
+
+        # pos_emb is shared across goal tokens + timestep tokens (state/action share timestep positions)
+        # seq_size = [goal_seq_len] + [obs_seq_len]
+        self.seq_size = goal_seq_len + obs_seq_len
+
         self.encoder = TransformerEncoder(
             embed_dim=embed_dim,
             n_heads=16,
             attn_pdrop=0.3,
             resid_pdrop=0.1,
             n_layers=6,
-            block_size=goal_seq_len
-            + obs_seq_len
-            + action_seq_len
-            + 1,  # +1 for time token
+            block_size=self.block_size,
             causal=True,
             bias=False,
             use_cross_attention=False,
         )
-
-        self.device = device
-
-        # mainly used for language condition or goal image condition
-        self.goal_conditioned = goal_conditioned
-        if not goal_conditioned:
-            goal_seq_len = 0
-
-        # the seq_size is the number of tokens in the input sequence
-        self.seq_size = goal_seq_len + obs_seq_len + action_seq_len
 
         # linear embedding for the state
         self.tok_emb = nn.Linear(state_dim, embed_dim)
@@ -345,15 +354,14 @@ class Noise_Dec_only(nn.Module):
             self.sigma_emb = BESO_TimeEmbedding(embed_dim)
         else:
             raise ValueError(f"Diffusion type {diffusion_type} is not supported")
-
-        # position embedding
+        
         self.use_pos_emb = use_pos_emb
-        if use_pos_emb:
+
+        if self.use_pos_emb:
             self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
-        else: ## why still position embeddings
-            self.pos_emb = nn.Parameter(
-                torch.zeros(1, goal_seq_len + action_seq_len, embed_dim)
-            )
+        else:
+            self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
+
 
         self.drop = nn.Dropout(embed_pdrob)
         self.drop.to(self.device)
@@ -390,6 +398,8 @@ class Noise_Dec_only(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight) ## not using nn.LayerNorm
+        elif isinstance(module, Noise_Dec_only):
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
 
     def forward(self, states, actions, goals, sigma):
         if len(states.size()) != 3:
@@ -398,36 +408,64 @@ class Noise_Dec_only(nn.Module):
         b, t, dim = states.size()
         _, t_a, _ = actions.size()
 
+        if t != t_a:
+            raise ValueError(
+                f"Beso expects action and state have the same sequence lenth"
+                f"got states{t}, action{t_a}"
+            )
+        
+        emb_t = self.sigma_emb(sigma) # [B, 1, D]
+        state_embed = self.tok_emb(states) # [B, T, D]
+        action_embed = self.action_emb(actions) # [B, T, D]
+        
         if self.goal_conditioned:
             goal_embed = self.goal_emb(goals)
-            goal_embed += self.pos_emb[:, : self.goal_seq_len, :]
-            goal_x = self.drop(goal_embed)
-        action_embed = self.action_emb(actions) ## no action position embeddings 
-        action_x = self.drop(action_embed)
-        state_embed = self.tok_emb(states)
-        if self.use_pos_emb: ## sequence not right
-            state_embed += self.pos_emb[
-                :, self.goal_seq_len + t_a : (self.goal_seq_len + t_a + t), :
-            ]
-        state_x = self.drop(state_embed)
+
+        # add position_emb
+        if self.use_pos_emb:
+            if self.goal_conditioned:
+                position_embeddings = self.pos_emb[: , :(self.goal_seq_len + t), :]
+                goal_embed = goal_embed + position_embeddings[:, : self.goal_seq_len, :]
+                step_pos = position_embeddings[:, self.goal_seq_len : self.goal_seq_len + t, :]
+            else:
+                position_embeddings = self.pos_emb[:, :t, :]
+                step_pos = position_embeddings
+
+            state_embed = state_embed + step_pos
+            action_embed = action_embed + step_pos
         
-        ## use c_noise
-        emb_t = self.sigma_emb(sigma)
-
+        # dropout
         if self.goal_conditioned:
-            input_seq = torch.cat([emb_t, goal_x, state_x, action_x], dim=1)
+            goal_x = self.drop(goal_embed)
+        state_x = self.drop(state_embed)
+        action_x = self.drop(action_embed)
+
+        # interleave [state_1, action_1, state_2, action_2, ...]
+        sa_seq = (
+            torch.stack([state_x, action_x], dim=1)
+            .permute(0, 2, 1, 3)
+            .reshape(b, t * 2, self.embed_dim)
+        )
+            
+        if self.goal_conditioned:
+            encoder_input = torch.cat([emb_t, goal_x, sa_seq], dim=1)
+            second_half_index = self.goal_seq_len + 1
         else:
-            input_seq = torch.cat([emb_t, state_x, action_x], dim=1)
-        ## emb_t maybe not suitable for custom_attn_mask
+            encoder_input = torch.cat([emb_t, sa_seq], dim=1)
+            second_half_index = 1
+
         if self.use_ada_conditioning:
-            encoder_output = self.encoder(input_seq, emb_t)
+            encoder_output = self.encoder(encoder_input, emb_t)
         else:
-            encoder_output = self.encoder(input_seq)
+            encoder_output = self.encoder(encoder_input)
 
-        pred_actions = self.action_pred(encoder_output[:, -self.action_seq_len :, :])
+        x = encoder_output[:, second_half_index :, :]
+        x = x.reshape(b, t, 2, self.embed_dim).permute(0, 2, 1, 3)
+
+        action_tokens = x[:,1]
+        pred_actions = self.action_pred(action_tokens)
         return pred_actions
-
-
+        
 class TransformerEncoder(nn.Module):
     def __init__(
         self,
