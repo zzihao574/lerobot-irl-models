@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from .utils import BESO_TimeEmbedding
 
-
+##
 class LayerNorm(nn.Module):
     """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
 
@@ -69,7 +69,7 @@ class Attention(nn.Module):
             print(
                 "WARNING: Using slow attention. Flash Attention requires PyTorch >= 2.0"
             )
-        # Dynamically compute causal mask instead of using a fixed bias buffer
+        ## Dynamically compute causal mask instead of using a fixed bias buffer
         self.block_size = block_size
         self.qk_norm = qk_norm
         # init qk norm if enabled
@@ -78,7 +78,7 @@ class Attention(nn.Module):
             self.k_norm = RMSNorm(n_embd // self.n_head, eps=1e-6)
         else:
             self.q_norm = self.k_norm = nn.Identity()
-
+    ##context
     def forward(self, x, context=None, custom_attn_mask=None):
         B, T, C = x.size()
 
@@ -113,7 +113,7 @@ class Attention(nn.Module):
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # Optimize custom attention masking
+            ## Optimize custom attention masking(could be wrong)
             if custom_attn_mask is not None:
                 att = att.masked_fill(custom_attn_mask == 0, float("-inf"))
             elif self.causal:
@@ -227,7 +227,7 @@ class AdaLNZero(nn.Module):
 def modulate(x, shift, scale):
     return shift + (x * (scale))
 
-
+##
 class ConditionedBlock(Block):
     """
     Block with AdaLN-Zero conditioning.
@@ -350,7 +350,7 @@ class Noise_Dec_only(nn.Module):
         self.use_pos_emb = use_pos_emb
         if use_pos_emb:
             self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
-        else:
+        else: ## why still position embeddings
             self.pos_emb = nn.Parameter(
                 torch.zeros(1, goal_seq_len + action_seq_len, embed_dim)
             )
@@ -365,7 +365,7 @@ class Noise_Dec_only(nn.Module):
         self.goal_seq_len = goal_seq_len
         self.obs_seq_len = obs_seq_len
         self.action_seq_len = action_seq_len
-
+        ## used with custom_attn_mask
         self.use_ada_conditioning = use_ada_conditioning
 
         # action pred module
@@ -389,7 +389,7 @@ class Noise_Dec_only(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
+            torch.nn.init.ones_(module.weight) ## not using nn.LayerNorm
 
     def forward(self, states, actions, goals, sigma):
         if len(states.size()) != 3:
@@ -402,22 +402,23 @@ class Noise_Dec_only(nn.Module):
             goal_embed = self.goal_emb(goals)
             goal_embed += self.pos_emb[:, : self.goal_seq_len, :]
             goal_x = self.drop(goal_embed)
-        action_embed = self.action_emb(actions)
+        action_embed = self.action_emb(actions) ## no action position embeddings 
         action_x = self.drop(action_embed)
         state_embed = self.tok_emb(states)
-        if self.use_pos_emb:
+        if self.use_pos_emb: ## sequence not right
             state_embed += self.pos_emb[
                 :, self.goal_seq_len + t_a : (self.goal_seq_len + t_a + t), :
             ]
         state_x = self.drop(state_embed)
-
+        
+        ## use c_noise
         emb_t = self.sigma_emb(sigma)
 
         if self.goal_conditioned:
             input_seq = torch.cat([emb_t, goal_x, state_x, action_x], dim=1)
         else:
             input_seq = torch.cat([emb_t, state_x, action_x], dim=1)
-
+        ## emb_t maybe not suitable for custom_attn_mask
         if self.use_ada_conditioning:
             encoder_output = self.encoder(input_seq, emb_t)
         else:

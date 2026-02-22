@@ -60,7 +60,7 @@ class BesoPolicy(PreTrainedPolicy):
         )
         self.unnormalize_inputs = UnnormalizerProcessorStep(
             config.input_features, config.normalization_mapping, dataset_stats
-        )
+        ) ## pay attention to input/output features
         self.step_counter = 0
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
@@ -96,6 +96,7 @@ class BesoPolicy(PreTrainedPolicy):
 
         return actions
 
+    # ========= inference  ============
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         # in select_action(...)
@@ -121,6 +122,7 @@ class BesoPolicy(PreTrainedPolicy):
         self.step_counter += 1
         return action
 
+    # ========= training  ============
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self.normalize_inputs(batch)
@@ -180,7 +182,7 @@ class BesoModel(nn.Module):
             global_cond_dim += clip_text_dim
 
         self.dit_backbone = Noise_Dec_only(
-            state_dim=global_cond_dim * 2,
+            state_dim=global_cond_dim * 2, ## hard defined
             action_dim=self.config.action_feature.shape[0],
             goal_dim=0,
             device="cuda",  # Default device, will be moved to correct device automatically by PyTorch
@@ -188,7 +190,7 @@ class BesoModel(nn.Module):
             embed_dim=config.embed_dim,
             embed_pdrob=0,
             goal_seq_len=0,
-            obs_seq_len=self.config.n_obs_steps,
+            obs_seq_len=self.config.n_obs_steps, ## should be 1
             action_seq_len=self.config.horizon,
             # linear_output=False,
             use_ada_conditioning=False,
@@ -229,7 +231,7 @@ class BesoModel(nn.Module):
         print("=" * 40)
 
     # ========= inference  ============
-    def conditional_sample(
+    def conditional_sample( 
         self,
         batch_size: int,
         global_cond: Tensor | None = None,
@@ -254,20 +256,21 @@ class BesoModel(nn.Module):
             * self.sigma_max
         )
         input_state = global_cond
-        sigmas = get_sigmas_exponential(
-            self.config.sampling_steps,
+        sigmas = get_sigmas_exponential( 
+            self.config.sampling_steps, ## here samping steps maybe wrong because inferece
             self.config.sigma_min,
             self.config.sigma_max,
             device,
         )
+        ## maybe wrong in the paper
         actions = sample_ddim(self, input_state, actions, None, sigmas)
 
         return actions
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-
-        # 1) state as-is (FIX)
+        ## no goal input here
+        ## 1) state as-is (FIX) can be wrong 
         state_feats = torch.zeros_like(batch[OBS_STATE])  # (B, S, state_dim)
 
         global_cond_feats = [state_feats]
@@ -363,7 +366,8 @@ class BesoModel(nn.Module):
         actions = actions[:, start:end]
 
         return actions
-
+    
+    # ========= training  ============
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
@@ -372,7 +376,7 @@ class BesoModel(nn.Module):
         horizon = batch["action"].shape[1]
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, 1, global_cond_dim)
 
         # Forward diffusion.
         trajectory = batch["action"]
@@ -393,7 +397,8 @@ class BesoModel(nn.Module):
         noised_input = trajectory + noise * append_dims(sigmas, trajectory.ndim)
         model_output = self.dit_backbone(global_cond, noised_input * c_in, None, sigmas)
         target = (trajectory - c_skip * noised_input) / c_out
-
+        
+        ## alpha is used 1/c^2out
         loss = F.mse_loss(model_output, target, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
@@ -414,6 +419,7 @@ class BesoModel(nn.Module):
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
 
+    ## not aligned to paper(used in sample_ddim)
     def forward(self, state, action, goal, sigma):
         c_skip, c_out, c_in = [
             append_dims(x, action.ndim) for x in self.get_scalings(sigma)
