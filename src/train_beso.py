@@ -14,6 +14,7 @@ def train(data_dir="data"):
     print("\nStarting training...")
     dataset_cfg = DatasetConfig(repo_id="my_dataset", root=data_dir)
     default_kwargs = {
+        # LeRobot vision encoder settings
         "vision_backbone": "resnet34",
         # "pretrained_backbone_weights": "ResNet34_Weights.IMAGENET1K_V1",
         "crop_shape": (224, 224),
@@ -24,9 +25,16 @@ def train(data_dir="data"):
         "num_train_timesteps": 1000,
         "diffusion_step_embed_dim": 512,
         "prediction_type": "sample",
-        # "n_obs_steps": n_obs_steps,
-        "horizon": 32,
-        "n_action_steps": 16,
+        # BESO algorithm settings (kept in BesoConfig, passed as kwargs here)
+        "window_size": 16,  # maps to both n_obs_steps and horizon for interleaved BESO
+        "n_action_steps": 8,
+        "sampling_steps": 3,
+        "sigma_min": 0.005,
+        "sigma_max": 1.0,
+        "use_ema": True,
+        "ema_decay": 0.999,
+        "ema_update_every_n_steps": 1,
+        "linear_output": True,
         "spatial_softmax_num_keypoints": 32,
     }
     pretrained_config = BesoConfig(push_to_hub=False, **default_kwargs)

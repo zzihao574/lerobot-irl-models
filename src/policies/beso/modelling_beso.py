@@ -23,7 +23,13 @@ from transformers import CLIPModel, CLIPProcessor
 
 from .beso_config import BesoConfig
 from .beso_transformer import Noise_Dec_only
-from .utils import append_dims, get_sigmas_exponential, make_sample_density, sample_ddim
+from .utils import (
+    ExponentialMovingAverage,
+    append_dims,
+    get_sigmas_exponential,
+    make_sample_density,
+    sample_ddim,
+)
 
 
 class BesoPolicy(PreTrainedPolicy):
@@ -60,15 +66,72 @@ class BesoPolicy(PreTrainedPolicy):
         )
         self.unnormalize_inputs = UnnormalizerProcessorStep(
             config.input_features, config.normalization_mapping, dataset_stats
-        ) ## pay attention to input/output features
+        )
         self.step_counter = 0
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
         # self.
         self.diffusion = BesoModel(config)
+        self._ema_helper = None
+        self._ema_updates = 0
+        self._ema_applied_for_eval = False
+        if self.config.use_ema:
+            self._reset_ema_from_current_weights()
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
+
+    def _store_original_weights_and_apply_ema(self):
+        if self._ema_helper is None or self._ema_applied_for_eval:
+            return
+        self._ema_helper.store(self.diffusion.parameters())
+        self._ema_helper.copy_to(self.diffusion.parameters())
+        self._ema_applied_for_eval = True
+
+    def _restore_original_weights(self):
+        if self._ema_helper is None or not self._ema_applied_for_eval:
+            return
+        self._ema_helper.restore(self.diffusion.parameters())
+        self._ema_applied_for_eval = False
+
+    def _reset_ema_from_current_weights(self):
+        self._ema_helper = ExponentialMovingAverage(
+            self.diffusion.parameters(), self.config.ema_decay
+        )
+        self._ema_applied_for_eval = False
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._restore_original_weights()
+        result = super().train(mode)
+        if not mode:
+            self._store_original_weights_and_apply_ema()
+        return result
+
+    def update(self):
+        if self._ema_helper is None:
+            return
+        self._ema_updates += 1
+        if self._ema_updates % self.config.ema_update_every_n_steps == 0:
+            self._ema_helper.update(self.diffusion.parameters())
+
+    def _save_pretrained(self, save_directory):
+        # Save EMA weights for checkpoints to match BESO source behavior.
+        if self._ema_helper is None or self._ema_applied_for_eval:
+            return super()._save_pretrained(save_directory)
+        self._store_original_weights_and_apply_ema()
+        try:
+            return super()._save_pretrained(save_directory)
+        finally:
+            self._restore_original_weights()
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        incompatible = super().load_state_dict(state_dict, strict=strict)
+        # Rebuild EMA shadow from the loaded weights. Otherwise a stale shadow from random init
+        # can overwrite loaded parameters when `eval()` triggers EMA application.
+        if self.config.use_ema:
+            self._reset_ema_from_current_weights()
+        return incompatible
 
     def reset(self):
         """Clear observation and action queues. Should be called on env.reset()"""
@@ -86,12 +149,16 @@ class BesoPolicy(PreTrainedPolicy):
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        batch = {
+        queued_batch = {
             k: torch.stack(list(self._queues[k]), dim=1)
             for k in batch
             if k in self._queues
         }
-        actions = self.diffusion.generate_actions(batch)
+        for k, v in batch.items():
+            if k not in queued_batch:
+                queued_batch[k] = v
+
+        actions = self.diffusion.generate_actions(queued_batch)
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
 
         return actions
@@ -149,8 +216,11 @@ class BesoModel(nn.Module):
         self.sigma_min = config.sigma_min
         self.act_seq_len = config.horizon
         self.sampling_steps = config.sampling_steps
+        self.goal_conditioned = config.goal_conditioned
+        self.goal_feature = config.goal_feature
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
+        goal_dim = 0
 
         if self.config.image_features:
             num_images = len(self.config.image_features)
@@ -164,6 +234,11 @@ class BesoModel(nn.Module):
 
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+
+        if self.goal_conditioned:
+            # Goal is represented as [B, G, D_goal] at runtime; use the last feature dim as D_goal.
+            goal_shape = self.config.input_features[self.goal_feature].shape
+            goal_dim = goal_shape[-1]
 
         # Initialize CLIP text encoder for language instructions
         if self.config.use_language:
@@ -184,18 +259,21 @@ class BesoModel(nn.Module):
         self.dit_backbone = Noise_Dec_only(
             state_dim=global_cond_dim,
             action_dim=self.config.action_feature.shape[0],
-            goal_dim=0,
-            device="cpu",  # Default device, will be moved to correct device automatically by PyTorch
-            goal_conditioned=False,
+            goal_dim=goal_dim,
+            goal_conditioned=self.goal_conditioned,
             embed_dim=config.embed_dim,
-            embed_pdrob=0,
-            goal_seq_len=0,
-            obs_seq_len=self.config.n_obs_steps, 
+            embed_pdrob=config.embed_pdrop,
+            goal_seq_len=self.config.goal_seq_len,
+            obs_seq_len=self.config.n_obs_steps,
             action_seq_len=self.config.horizon,
-            # linear_output=False,
-            use_ada_conditioning=False,
-            diffusion_type="beso",  # ddpm, beso or rf,
-            use_pos_emb=True,
+            linear_output=self.config.linear_output,
+            use_pos_emb=self.config.use_pos_emb,
+            n_layers=self.config.n_layers,
+            n_heads=self.config.n_heads,
+            attn_pdrop=self.config.attn_pdrop,
+            resid_pdrop=self.config.resid_pdrop,
+            mlp_pdrop=self.config.mlp_pdrop,
+            qk_norm=self.config.qk_norm,
         )
         self.device = None
 
@@ -231,16 +309,22 @@ class BesoModel(nn.Module):
         print("=" * 40)
 
     # ========= inference  ============
-    def conditional_sample( 
+    def conditional_sample(
         self,
         batch_size: int,
         global_cond: Tensor | None = None,
+        goal_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
+        # Symbols:
+        #   B=batch_size, T=horizon, A=action_dim, S=n_obs_steps, D_state=D_state_cond, G=goal_seq_len, D_goal=goal_dim
+        # Inputs:
+        #   global_cond: [B, S, D_state] or None
+        #   goal_cond:   [B, G, D_goal] or None
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        # Sample prior.
+        # Sample Gaussian prior at sigma_max.
         actions = (
             torch.randn(
                 size=(
@@ -248,29 +332,29 @@ class BesoModel(nn.Module):
                     self.config.horizon,
                     self.config.action_feature.shape[0],
                 ),
-                # size=(batch_size, 8, self.config.action_feature.shape[0]),
                 dtype=dtype,
                 device=device,
                 generator=generator,
             )
             * self.sigma_max
         )
+        # actions: [B, T, A]
         input_state = global_cond
-        sigmas = get_sigmas_exponential( 
-            self.config.sampling_steps, ## here samping steps maybe wrong because inferece
+        sigmas = get_sigmas_exponential(
+            self.config.sampling_steps,
             self.config.sigma_min,
             self.config.sigma_max,
             device,
         )
-        ## maybe wrong in the paper
-        actions = sample_ddim(self, input_state, actions, None, sigmas)
+        # sigmas: [N+1] DDIM noise schedule (includes terminal 0)
+        actions = sample_ddim(self, input_state, actions, goal_cond, sigmas)
+        # actions (denoised sample): [B, T, A]
 
         return actions
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        ## no goal input here
-        ## 1) state as-is (FIX) can be wrong 
+        # 1) state as-is
         state_feats = batch[OBS_STATE]  # (B, S, state_dim)
 
         global_cond_feats = [state_feats]
@@ -282,6 +366,7 @@ class BesoModel(nn.Module):
                 images_per_camera = einops.rearrange(
                     batch["observation.images"], "b s n ... -> n (b s) ..."
                 )
+                # images_per_camera: [N_cam, B*S, C, H, W]
                 img_features_list = torch.cat(
                     [
                         encoder(images)
@@ -296,6 +381,7 @@ class BesoModel(nn.Module):
                     b=batch_size,
                     s=n_obs_steps,
                 )
+                # img_features: [B, S, N_cam*D_img]
             else:
                 num_cameras = len(self.config.image_features)
                 shared = self.rgb_encoder(
@@ -303,6 +389,7 @@ class BesoModel(nn.Module):
                         batch["observation.images"], "b s n ... -> (b s n) ..."
                     )
                 )
+                # shared: [B*S*N_cam, D_img]
                 img_features = einops.rearrange(
                     shared,
                     "(b s n) d -> b s (n d)",
@@ -310,6 +397,7 @@ class BesoModel(nn.Module):
                     s=n_obs_steps,
                     n=num_cameras,
                 )
+                # img_features: [B, S, N_cam*D_img]
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
@@ -350,20 +438,45 @@ class BesoModel(nn.Module):
                 global_cond_feats.append(text_features)
 
         feats = torch.cat(global_cond_feats, dim=-1)
+        # feats / global_cond: [B, S, D_state_cond]
 
         return feats
+
+    def _prepare_goal_conditioning(self, batch: dict[str, Tensor]) -> Tensor | None:
+        if not self.goal_conditioned:
+            return None
+
+        # Clean goal interface: [B, G, D_goal]
+        goal = batch[self.goal_feature]
+        if goal.ndim != 3:
+            raise ValueError(
+                f"Goal tensor must have shape [B, G, D_goal], got {tuple(goal.shape)}"
+            )
+        if goal.shape[1] != self.config.goal_seq_len:
+            raise ValueError(
+                f"Goal sequence length mismatch: got {goal.shape[1]}, expected {self.config.goal_seq_len}"
+            )
+        # goal_cond: [B, G, D_goal]
+        return goal
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, S，global_cond_dim)
-        # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
+        goal_cond = self._prepare_goal_conditioning(batch)
+        # Run DDIM sampling.
+        actions = self.conditional_sample(
+            batch_size,
+            global_cond=global_cond,
+            goal_cond=goal_cond,
+        )
+        # actions: [B, T, A]
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+        # returned actions: [B, n_action_steps, A]
 
         return actions
     
@@ -374,15 +487,14 @@ class BesoModel(nn.Module):
         assert "observation.images" in batch or "observation.environment_state" in batch
         n_obs_steps = batch["observation.state"].shape[1]
         horizon = batch["action"].shape[1]
-        assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
-        global_cond = self._prepare_global_conditioning(batch)  # (B, 1, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
+        goal_cond = self._prepare_goal_conditioning(batch)
 
         # Forward diffusion.
-        trajectory = batch["action"]
+        trajectory = batch["action"]  # [B, T, A]
 
         # Sample noise to add to the trajectory.
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
+        noise = torch.randn(trajectory.shape, device=trajectory.device)  # [B, T, A]
         # Sample a random noising timestep for each item in the batch.
         device = trajectory.device
 
@@ -394,15 +506,19 @@ class BesoModel(nn.Module):
             shape=(len(trajectory),),
             device=device,
         ).to(device)
+        # sigmas: [B] (one sigma per sample, not the DDIM schedule)
 
         c_skip, c_out, c_in = [
             append_dims(x, trajectory.ndim) for x in self.get_scalings(sigmas)
         ]
+        # c_skip, c_out, c_in: [B, 1, 1] (broadcast to [B, T, A])
         noised_input = trajectory + noise * append_dims(sigmas, trajectory.ndim)
-        model_output = self.dit_backbone(global_cond, noised_input * c_in, None, sigmas)
+        # noised_input: [B, T, A]
+        model_output = self.dit_backbone(global_cond, noised_input * c_in, goal_cond, sigmas)
+        # model_output: [B, T, A]
         target = (trajectory - c_skip * noised_input) / c_out
+        # target: [B, T, A]
         
-        ## alpha is used 1/c^2out
         loss = F.mse_loss(model_output, target, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
@@ -423,8 +539,9 @@ class BesoModel(nn.Module):
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
 
-    ## not aligned to paper(used in sample_ddim)
+    # Preconditioned denoiser wrapper used by sample_ddim.
     def forward(self, state, action, goal, sigma):
+        # state: [B, S, D_state_cond], action: [B, T, A], goal: [B, G, D_goal] or None, sigma: [B]
         c_skip, c_out, c_in = [
             append_dims(x, action.ndim) for x in self.get_scalings(sigma)
         ]

@@ -1,8 +1,59 @@
 import math
 import torch
 from functools import partial
-import einops
-from torch import nn
+
+
+class ExponentialMovingAverage:
+    """Lightweight EMA helper for model parameters."""
+
+    def __init__(self, parameters, decay: float):
+        if not (0.0 < decay <= 1.0):
+            raise ValueError(f"EMA decay must be in (0, 1], got {decay}")
+        self.decay = decay
+        self.shadow_params = [
+            p.detach().clone()
+            for p in parameters
+            if p.requires_grad
+        ]
+        self.collected_params = None
+
+    def _iter_params(self, parameters):
+        return [p for p in parameters if p.requires_grad]
+
+    @torch.no_grad()
+    def update(self, parameters):
+        params = self._iter_params(parameters)
+        if len(params) != len(self.shadow_params):
+            raise ValueError("Parameter set changed after EMA initialization.")
+        one_minus_decay = 1.0 - self.decay
+        for shadow, param in zip(self.shadow_params, params, strict=True):
+            shadow.mul_(self.decay).add_(param.detach(), alpha=one_minus_decay)
+
+    @torch.no_grad()
+    def store(self, parameters):
+        self.collected_params = [
+            p.detach().clone()
+            for p in self._iter_params(parameters)
+        ]
+
+    @torch.no_grad()
+    def copy_to(self, parameters):
+        params = self._iter_params(parameters)
+        if len(params) != len(self.shadow_params):
+            raise ValueError("Parameter set changed after EMA initialization.")
+        for param, shadow in zip(params, self.shadow_params, strict=True):
+            param.copy_(shadow)
+
+    @torch.no_grad()
+    def restore(self, parameters):
+        if self.collected_params is None:
+            return
+        params = self._iter_params(parameters)
+        if len(params) != len(self.collected_params):
+            raise ValueError("Parameter set changed after EMA store.")
+        for param, saved in zip(params, self.collected_params, strict=True):
+            param.copy_(saved)
+        self.collected_params = None
 
 
 def append_dims(x, target_dims):
@@ -59,41 +110,6 @@ def get_sigmas_exponential(n, sigma_min, sigma_max, device="cpu"):
         math.log(sigma_max), math.log(sigma_min), n, device=device
     ).exp()
     return torch.cat([sigmas, sigmas.new_zeros([1])])
-
-
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class BESO_TimeEmbedding(nn.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-
-        self.sigma_emb = nn.Sequential(
-            SinusoidalPosEmb(embed_dim),
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.Mish(),
-            nn.Linear(embed_dim * 2, embed_dim),
-        )
-
-    def forward(self, sigma):
-        sigmas = sigma.log() / 4
-        sigmas = einops.rearrange(sigmas, "b -> b 1")
-        emb_t = self.sigma_emb(sigmas)
-        if len(emb_t.shape) == 2:
-            emb_t = einops.rearrange(emb_t, "b d -> b 1 d")
-        return emb_t
 
 
 @torch.no_grad()
