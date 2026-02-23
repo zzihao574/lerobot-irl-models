@@ -33,6 +33,8 @@ class BesoConfig(DiffusionConfig):
         goal_conditioned: bool = False,
         goal_feature: str | None = None,
         goal_seq_len: int = 1,
+        cond_mask_prob: float = 0.1,
+        cond_lambda: float = 1.25,  
         # Language instruction parameters
         use_language: bool = False,
         clip_model_name: str = "openai/clip-vit-base-patch32",
@@ -99,6 +101,10 @@ class BesoConfig(DiffusionConfig):
         self.goal_conditioned = goal_conditioned
         self.goal_feature = goal_feature
         self.goal_seq_len = goal_seq_len
+
+        # CFG
+        self.cond_mask_prob = cond_mask_prob
+        self.cond_lambda = cond_lambda
 
         # Language parameters
         self.use_language = use_language

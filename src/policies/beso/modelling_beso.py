@@ -261,6 +261,7 @@ class BesoModel(nn.Module):
             action_dim=self.config.action_feature.shape[0],
             goal_dim=goal_dim,
             goal_conditioned=self.goal_conditioned,
+            cond_mask_prob=self.config.cond_mask_prob,
             embed_dim=config.embed_dim,
             embed_pdrob=config.embed_pdrop,
             goal_seq_len=self.config.goal_seq_len,
@@ -346,8 +347,12 @@ class BesoModel(nn.Module):
             self.config.sigma_max,
             device,
         )
-        # sigmas: [N+1] DDIM noise schedule (includes terminal 0)
-        actions = sample_ddim(self, input_state, actions, goal_cond, sigmas)
+        
+        extra_args = None
+        if self.goal_conditioned and goal_cond is not None:
+            extra_args = {"cond_lambda": self.config.cond_lambda}
+
+        actions = sample_ddim(self, input_state, actions, goal_cond, sigmas, extra_args=extra_args)
         # actions (denoised sample): [B, T, A]
 
         return actions
@@ -538,18 +543,25 @@ class BesoModel(nn.Module):
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
-
-    # Preconditioned denoiser wrapper used by sample_ddim.
-    def forward(self, state, action, goal, sigma):
-        # state: [B, S, D_state_cond], action: [B, T, A], goal: [B, G, D_goal] or None, sigma: [B]
+    
+    def _forward_precond(self, state, action, goal, sigma, uncond: bool=False):
         c_skip, c_out, c_in = [
             append_dims(x, action.ndim) for x in self.get_scalings(sigma)
         ]
-        return (
-            self.dit_backbone(state, action * c_in, goal, sigma) * c_out
-            + action * c_skip
-        )
+        return self.dit_backbone(state, action * c_in, goal, sigma, uncond=uncond) * c_out + action * c_skip
 
+    # Preconditioned denoiser wrapper used by sample_ddim.
+    def forward(self, state, action, goal, sigma, uncond: bool=False, cond_lambda: float | None = None):
+        # state: [B, S, D_state_cond], action: [B, T, A], goal: [B, G, D_goal] or None, sigma: [B]
+        # No goal path (or explicit unconditional branch): single forward
+        if (not self.goal_conditioned) or (goal is None) or uncond or cond_lambda == 1.0:
+            return self._forward_precond(state, action, goal, sigma, uncond=uncond)
+
+        # CFG sampling (source-equivalent behavior):
+        # out = out_uncond + cond_lambda * (out_cond - out_uncond)
+        out_cond = self._forward_precond(state, action, goal, sigma, uncond=False)
+        out_uncond = self._forward_precond(state, action, goal, sigma, uncond=True)
+        return out_uncond + cond_lambda * (out_cond - out_uncond)
 
 class SpatialSoftmax(nn.Module):
     """

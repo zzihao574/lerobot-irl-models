@@ -182,6 +182,7 @@ class Noise_Dec_only(nn.Module):
         action_dim: int,
         goal_dim: int,
         goal_conditioned: bool,
+        cond_mask_prob: float,
         embed_dim: int,
         embed_pdrob: float,
         goal_seq_len: int,
@@ -201,6 +202,7 @@ class Noise_Dec_only(nn.Module):
 
         # Goal tokens are optional (disabled in the current no-goal setup).
         self.goal_conditioned = goal_conditioned
+        self.cond_mask_prob = cond_mask_prob
         if not goal_conditioned:
             goal_seq_len = 0
 
@@ -284,7 +286,23 @@ class Noise_Dec_only(nn.Module):
         elif isinstance(module, Noise_Dec_only):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
 
-    def forward(self, states, actions, goals, sigma):
+    def mask_cond(self, goals, uncond: bool = False):
+        if goals is None:
+            return None
+        
+        if uncond:
+            return torch.zeros_like(goals)
+        
+        if self.training and self.cond_mask_prob > 0:
+            b, g ,d = goals.size()
+            mask = torch.bernoulli(
+                torch.full((b, g, d), self.cond_mask_prob, device=goals.device, dtype=goals.dtype)
+            )
+            return goals * (1.0 - mask)
+        
+        return goals
+
+    def forward(self, states, actions, goals, sigma, uncond: bool = False):
         # Symbols:
         #   B=batch, T=sequence length (state/action tokens per modality), G=goal_seq_len, E=embed_dim, A=action_dim
         # Inputs:
@@ -310,6 +328,10 @@ class Noise_Dec_only(nn.Module):
         if self.goal_conditioned:
             if goals is None:
                 raise ValueError("goals must be provided when goal_conditioned=True")
+            goals = self.mask_cond(goals)
+
+            if uncond:
+                goals = self.mask_cond(goals, uncond=True)
             goal_embed = self.goal_emb(goals)  # [B, G, E]
 
         # Add shared timestep position embeddings (and optional goal positions).
