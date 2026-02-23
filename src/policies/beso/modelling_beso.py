@@ -11,7 +11,6 @@ from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
     get_output_shape,
-    populate_queues,
 )
 from lerobot.processor.normalize_processor import (
     NormalizerProcessorStep,
@@ -70,6 +69,7 @@ class BesoPolicy(PreTrainedPolicy):
         self.step_counter = 0
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
+        self._action_context = None
         # self.
         self.diffusion = BesoModel(config)
         self._ema_helper = None
@@ -147,8 +147,9 @@ class BesoPolicy(PreTrainedPolicy):
         """Clear observation and action queues. Should be called on env.reset()"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
-            "action": deque(maxlen=self.config.n_action_steps),
+            "action": deque(maxlen=1),
         }
+        self._action_context = deque(maxlen=self.config.n_obs_steps - 1)
 
         if self.config.image_features:
             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
@@ -158,21 +159,27 @@ class BesoPolicy(PreTrainedPolicy):
             )
     
     # ========= inference  ============
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Predict the latest action from queued observations.
+
+        Returns:
+            norm_actions: [B, 1, A] in normalized policy space (for action_context)
+            env_actions: [B, 1, A] in environment action space (for execution)
+        """
         queued_batch = {
             key: torch.stack(list(self._queues[key]), dim=1)
             for key in batch
             if key in self._queues
         }
+        if len(self._action_context) > 0:
+            queued_batch["action_context"] = torch.stack(list(self._action_context), dim=1)
         for key, value in batch.items():
             if key not in queued_batch:
                 queued_batch[key] = value
 
-        actions = self.diffusion.generate_actions(queued_batch)
-        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
-
-        return actions
+        norm_actions = self.diffusion.generate_actions(queued_batch)
+        env_actions = self.unnormalize_outputs({ACTION: norm_actions})[ACTION]
+        return norm_actions, env_actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -192,8 +199,9 @@ class BesoPolicy(PreTrainedPolicy):
         self._append_obs_queues(batch)
 
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)
-            self._queues[ACTION].extend(actions.transpose(0, 1))
+            norm_actions, env_actions = self.predict_action_chunk(batch)
+            self._action_context.extend(norm_actions.transpose(0, 1))
+            self._queues[ACTION].extend(env_actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
         self.step_counter += 1
@@ -327,6 +335,7 @@ class BesoModel(nn.Module):
         goal_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         action_seq_len: int | None = None,
+        action_context: Tensor | None = None,
     ) -> Tensor:
         # Symbols:
         #   B=batch_size, T=horizon, A=action_dim, S=n_obs_steps, D_state=D_state_cond, G=goal_seq_len, D_goal=goal_dim
@@ -339,20 +348,29 @@ class BesoModel(nn.Module):
         if action_seq_len is None:
             action_seq_len = self.config.horizon
             
-        # Sample Gaussian prior at sigma_max.
-        actions = (
-            torch.randn(
-                size=(
-                    batch_size,
-                    action_seq_len,
-                    self.config.action_feature.shape[0],
-                ),
-                dtype=dtype,
-                device=device,
-                generator=generator,
+        action_dim = self.config.action_feature.shape[0]
+        if action_context is None:
+            actions = (
+                torch.randn(
+                    size=(batch_size, action_seq_len, action_dim),
+                    dtype=dtype,
+                    device=device,
+                    generator=generator,
+                )
+                * self.sigma_max
             )
-            * self.sigma_max
-        )
+        else:
+            action_context = action_context.to(device=device, dtype=dtype)
+            noise_last = (
+                torch.randn(
+                    size=(batch_size, 1, action_dim),
+                    dtype=dtype,
+                    device=device,
+                    generator=generator,
+                )
+                * self.sigma_max
+            )
+            actions = torch.cat([action_context, noise_last], dim=1)
         # actions: [B, T, A]
         input_state = global_cond
         sigmas = get_sigmas_exponential(
@@ -486,12 +504,14 @@ class BesoModel(nn.Module):
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
         goal_cond = self._prepare_goal_conditioning(batch)
+        action_context = batch.get("action_context")
         # Run DDIM sampling.
         actions = self.conditional_sample(
             batch_size,
             global_cond=global_cond,
             goal_cond=goal_cond,
             action_seq_len=n_obs_steps,
+            action_context=action_context,
         )
         # actions: [B, T, A]
 
@@ -507,7 +527,6 @@ class BesoModel(nn.Module):
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
         assert "observation.images" in batch or "observation.environment_state" in batch
         n_obs_steps = batch["observation.state"].shape[1]
-        horizon = batch["action"].shape[1]
         global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
         goal_cond = self._prepare_goal_conditioning(batch)
 
@@ -569,6 +588,8 @@ class BesoModel(nn.Module):
     # Preconditioned denoiser wrapper used by sample_ddim.
     def forward(self, state, action, goal, sigma, uncond: bool=False, cond_lambda: float | None = None):
         # state: [B, S, D_state_cond], action: [B, T, A], goal: [B, G, D_goal] or None, sigma: [B]
+        if cond_lambda is None:
+            cond_lambda = self.config.cond_lambda
         # No goal path (or explicit unconditional branch): single forward
         if (not self.goal_conditioned) or (goal is None) or uncond or cond_lambda == 1.0:
             return self._forward_precond(state, action, goal, sigma, uncond=uncond)

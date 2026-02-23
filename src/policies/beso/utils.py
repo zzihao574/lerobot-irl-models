@@ -119,11 +119,9 @@ def sample_ddim(
     action,
     goal,
     sigmas,
-    scaler=None,
     extra_args=None,
     callback=None,
-    disable=None,
-    eta=1.0,
+    disable=None,  # Reserved for progress-bar compatibility (currently unused).
 ):
     """
     DPM-Solver 1( or DDIM sampler"""

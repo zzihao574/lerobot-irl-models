@@ -236,8 +236,11 @@ class Noise_Dec_only(nn.Module):
         # linear embedding for the state
         self.tok_emb = nn.Linear(state_dim, embed_dim)
 
-        # linear embedding for the goal
-        self.goal_emb = nn.Linear(goal_dim, embed_dim)
+        # linear embedding for the goal (only needed in goal-conditioned mode)
+        if self.goal_conditioned:
+            self.goal_emb = nn.Linear(goal_dim, embed_dim)
+        else:
+            self.goal_emb = None
         # linear embedding for the action
 
         self.action_emb = nn.Linear(action_dim, embed_dim)
