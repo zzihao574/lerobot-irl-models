@@ -133,6 +133,16 @@ class BesoPolicy(PreTrainedPolicy):
             self._reset_ema_from_current_weights()
         return incompatible
 
+    def _append_obs_queues(self, batch: dict[str, Tensor]):
+        """
+        Append latest observation tensors to queues without cold-start padding.
+        Unlike lerobot.populate_queues(...), this keeps the queue short at rollout start.
+        """
+        for key, q in self._queues.items():
+            if key == ACTION:
+                continue
+            q.append(batch[key])
+
     def reset(self):
         """Clear observation and action queues. Should be called on env.reset()"""
         self._queues = {
@@ -146,24 +156,24 @@ class BesoPolicy(PreTrainedPolicy):
             self._queues["observation.environment_state"] = deque(
                 maxlen=self.config.n_obs_steps
             )
-
+    
+    # ========= inference  ============
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         queued_batch = {
-            k: torch.stack(list(self._queues[k]), dim=1)
-            for k in batch
-            if k in self._queues
+            key: torch.stack(list(self._queues[key]), dim=1)
+            for key in batch
+            if key in self._queues
         }
-        for k, v in batch.items():
-            if k not in queued_batch:
-                queued_batch[k] = v
+        for key, value in batch.items():
+            if key not in queued_batch:
+                queued_batch[key] = value
 
         actions = self.diffusion.generate_actions(queued_batch)
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
 
         return actions
 
-    # ========= inference  ============
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         # in select_action(...)
@@ -178,8 +188,8 @@ class BesoPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
-        # NOTE: It's important that this happens after stacking the images into a single key.
-        self._queues = populate_queues(self._queues, batch)
+        
+        self._append_obs_queues(batch)
 
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch)
@@ -316,6 +326,7 @@ class BesoModel(nn.Module):
         global_cond: Tensor | None = None,
         goal_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
+        action_seq_len: int | None = None,
     ) -> Tensor:
         # Symbols:
         #   B=batch_size, T=horizon, A=action_dim, S=n_obs_steps, D_state=D_state_cond, G=goal_seq_len, D_goal=goal_dim
@@ -325,12 +336,15 @@ class BesoModel(nn.Module):
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
+        if action_seq_len is None:
+            action_seq_len = self.config.horizon
+            
         # Sample Gaussian prior at sigma_max.
         actions = (
             torch.randn(
                 size=(
                     batch_size,
-                    self.config.horizon,
+                    action_seq_len,
                     self.config.action_feature.shape[0],
                 ),
                 dtype=dtype,
@@ -466,7 +480,9 @@ class BesoModel(nn.Module):
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
-        assert n_obs_steps == self.config.n_obs_steps
+        assert 1 <= n_obs_steps <= self.config.n_obs_steps, (
+            f"Expected 1 <= n_obs_steps <= {self.config.n_obs_steps}, got {n_obs_steps}"
+        )
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
         goal_cond = self._prepare_goal_conditioning(batch)
@@ -475,13 +491,13 @@ class BesoModel(nn.Module):
             batch_size,
             global_cond=global_cond,
             goal_cond=goal_cond,
+            action_seq_len=n_obs_steps,
         )
         # actions: [B, T, A]
-        # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = n_obs_steps - 1
-        end = start + self.config.n_action_steps
-        actions = actions[:, start:end]
-        # returned actions: [B, n_action_steps, A]
+
+        # With source-aligned interleaved BESO (T_cur == S_cur), the executable action is the last action token.
+        # During cold start (short sequence) and after window is full, we return the latest action only.
+        actions = actions[:, -1:, :]
 
         return actions
     
