@@ -250,10 +250,7 @@ class Noise_Dec_only(nn.Module):
         
         self.use_pos_emb = use_pos_emb
 
-        if self.use_pos_emb:
-            self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
-        else:
-            self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
+        self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_size, embed_dim))
 
         self.drop = nn.Dropout(embed_pdrob)
 
@@ -262,8 +259,6 @@ class Noise_Dec_only(nn.Module):
         self.embed_dim = embed_dim
 
         self.goal_seq_len = goal_seq_len
-        self.obs_seq_len = obs_seq_len
-        self.action_seq_len = action_seq_len
 
         # action pred module
         if linear_output:

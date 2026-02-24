@@ -42,18 +42,20 @@ class BesoPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: BesoConfig,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        dataset_meta,
+        dataset_stats,
     ):
         """
         Args:
             config: Policy configuration class instance or None, in which case the default instantiation of
                 the configuration class is used.
-            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
-                that they will be passed with a call to load_state_dict before the policy is used.
+            dataset_meta: LeRobot dataset metadata. We use dataset_meta.stats for normalization stats.
+            dataset_stats: Passed by LeRobot factory as well (unused here; kept for exact factory compatibility).
         """
         super().__init__(config)
         config.validate_features()
         self.config = config
+        dataset_stats = dataset_meta.stats
         self.normalize_inputs = NormalizerProcessorStep(
             config.input_features, config.normalization_mapping, dataset_stats
         )
@@ -75,8 +77,6 @@ class BesoPolicy(PreTrainedPolicy):
         self._ema_helper = None
         self._ema_updates = 0
         self._ema_applied_for_eval = False
-        if self.config.use_ema:
-            self._reset_ema_from_current_weights()
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
@@ -109,7 +109,10 @@ class BesoPolicy(PreTrainedPolicy):
         return result
 
     def update(self):
+        if not self.config.use_ema:
+            return
         if self._ema_helper is None:
+            self._reset_ema_from_current_weights()
             return
         self._ema_updates += 1
         if self._ema_updates % self.config.ema_update_every_n_steps == 0:
@@ -178,6 +181,7 @@ class BesoPolicy(PreTrainedPolicy):
                 queued_batch[key] = value
 
         norm_actions = self.diffusion.generate_actions(queued_batch)
+        norm_actions = torch.clamp(norm_actions, -1.0, 1.0)
         env_actions = self.unnormalize_outputs({ACTION: norm_actions})[ACTION]
         return norm_actions, env_actions
 

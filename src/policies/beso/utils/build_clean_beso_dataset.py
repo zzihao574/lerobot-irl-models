@@ -18,6 +18,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import sys
@@ -207,6 +208,78 @@ def _build_episode_tables(merged_dataset, tail_ratio: float, goal_reduce: str):
     return episode_to_action, episode_to_state, episode_to_goal
 
 
+def _patch_visual_feature_names_if_missing(dataset_root: Path) -> None:
+    """
+    Some LeRobot versions expect ft['names'] for image/video features in meta/info.json.
+    Older datasets often omit this field for visual features, so patch it here once offline.
+    """
+    info_path = dataset_root / "meta" / "info.json"
+    with open(info_path, "r", encoding="utf-8") as f:
+        info = json.load(f)
+
+    features = info.get("features", {})
+    changed = False
+    for key, ft in features.items():
+        if not isinstance(ft, dict):
+            continue
+        if ft.get("dtype") in {"image", "video"} and "names" not in ft:
+            # LeRobot visual features are stored in dataset metadata as [H, W, C].
+            ft["names"] = ["height", "width", "channel"]
+            changed = True
+
+    if changed:
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Patched missing visual feature names in {info_path}")
+
+
+def _recompute_added_feature_stats(clean_dataset, goal_key: str) -> None:
+    """
+    Recompute stats.json entries for newly added numeric vector features.
+    We keep existing image/index stats and only update our derived keys.
+    """
+    from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+    from lerobot.datasets.utils import write_stats
+
+    hf = clean_dataset.hf_dataset.with_format(None)
+    target_keys = ["action", "observation.state", goal_key]
+
+    for k in target_keys:
+        if k not in clean_dataset.meta.features:
+            raise ValueError(f"Missing feature in dataset: {k}")
+
+    feature_desc = {k: clean_dataset.meta.features[k] for k in target_keys}
+    ep_stats_list = []
+    total_eps = clean_dataset.meta.total_episodes
+
+    for ep in range(total_eps):
+        from_idx = int(clean_dataset.meta.episodes["dataset_from_index"][ep])
+        to_idx = int(clean_dataset.meta.episodes["dataset_to_index"][ep])
+        ep_ds = hf.select(range(from_idx, to_idx))
+
+        ep_data = {}
+        for k in target_keys:
+            ep_data[k] = np.asarray(ep_ds[k], dtype=np.float32)
+
+        ep_stats = compute_episode_stats(ep_data, feature_desc)
+        ep_stats_list.append(ep_stats)
+
+        if ep < 3:
+            print(
+                f"[debug] ep={ep} lens={to_idx-from_idx} "
+                f"action_shape={ep_data['action'].shape} "
+                f"state_shape={ep_data['observation.state'].shape} "
+                f"goal_shape={ep_data[goal_key].shape}"
+            )
+
+    new_stats = aggregate_stats(ep_stats_list)
+    merged_stats = dict(clean_dataset.meta.stats) if clean_dataset.meta.stats is not None else {}
+    merged_stats.update(new_stats)
+    write_stats(merged_stats, clean_dataset.root)
+    print("[INFO] stats.json updated.")
+    print("[INFO] added/updated stats keys:", list(new_stats.keys()))
+
+
 def main():
     args = _parse_args()
 
@@ -331,6 +404,12 @@ def main():
         output_dir=output_root,
         repo_id=args.output_repo_id,
     )
+
+    # 4.1) Patch visual feature metadata for compatibility with some LeRobot versions.
+    _patch_visual_feature_names_if_missing(clean_dataset.root)
+
+    # 4.2) Recompute stats for newly added numeric vector features.
+    _recompute_added_feature_stats(clean_dataset, args.goal_key)
 
     print("[INFO] Clean dataset created.")
     print(f"[INFO] repo_id={clean_dataset.repo_id}")

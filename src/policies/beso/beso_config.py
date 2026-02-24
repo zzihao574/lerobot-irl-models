@@ -15,9 +15,9 @@ class BesoConfig(DiffusionConfig):
         # Sequence semantics (BESO interleaved transformer uses a single window length)
         window_size: int | None = None,
         # Transformer / backbone parameters
-        embed_dim: int = 448,
+        embed_dim: int = 360,
         n_layers: int = 6,
-        n_heads: int = 16,
+        n_heads: int = 6,
         attn_pdrop: float = 0.3,
         resid_pdrop: float = 0.0,
         mlp_pdrop: float = 0.0,
@@ -34,7 +34,7 @@ class BesoConfig(DiffusionConfig):
         goal_feature: str | None = None,
         goal_seq_len: int = 1,
         cond_mask_prob: float = 0.1,
-        cond_lambda: float = 1.25,  
+        cond_lambda: float = 1.5,  
         # Language instruction parameters
         use_language: bool = False,
         clip_model_name: str = "openai/clip-vit-base-patch32",
