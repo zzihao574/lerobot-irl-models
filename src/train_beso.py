@@ -22,43 +22,22 @@ def train(data_dir="data"):
         root=data_dir,
         video_backend="torchcodec",
     )
-    default_kwargs = {
-        # LeRobot vision encoder settings
-        "vision_backbone": "resnet34",
-        "pretrained_backbone_weights": "ResNet34_Weights.IMAGENET1K_V1",
-        "use_group_norm": False,
-        "crop_shape": (224, 224),
-        "use_separate_rgb_encoder_per_camera": True,
-        "down_dims": (128, 256),
-        "kernel_size": 3,
-        "n_groups": 8,
-        "num_train_timesteps": 1000,
-        "diffusion_step_embed_dim": 512,
-        "prediction_type": "sample",
-        # BESO algorithm settings (kept in BesoConfig, passed as kwargs here)
-        "window_size": 4,  # maps to both n_obs_steps and horizon for interleaved BESO
-        "n_action_steps": 1,
-        "sampling_steps": 3,
-        "sigma_min": 0.005,
-        "sigma_max": 1.0,
-        "use_ema": True,
-        "ema_decay": 0.999,
-        "ema_update_every_n_steps": 1,
-        "linear_output": True,
-        "spatial_softmax_num_keypoints": 32,
+    policy_overrides = {
+        # Experiment overrides on top of BesoConfig defaults.
+        "window_size": 4,
         "goal_conditioned": False,
-        "optimizer_betas": (0.9, 0.999),
-        "scheduler_warmup_steps": 100,   
+        "goal_feature": "observation.goal.tail_q202",
+        "goal_seq_len": 1,
     }
-    pretrained_config = BesoConfig(push_to_hub=False, **default_kwargs)
+    pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
     cfg = TrainPipelineConfig(
         policy=pretrained_config,
         dataset=dataset_cfg,
         batch_size=16,
-        num_workers=0,
+        num_workers=8,
         steps=40000,
         save_freq=4000,
-        log_freq=1,
+        log_freq=20,
         wandb=get_wandb_config(),
     )
 
@@ -66,19 +45,18 @@ def train(data_dir="data"):
     lerobot_train(cfg)
 
 
-def get_beso(typename: str, **kwargs):
+def get_beso(_typename: str, **_kwargs):
     from policies.beso.modelling_beso import BesoPolicy
 
     return BesoPolicy
 
 
 def get_wandb_config():
-    wandb_config = WandBConfig(
+    return WandBConfig(
         enable=True,
         project="beso_lerobot",
         mode="online",
     )
-    return wandb_config
 
 
 def main():

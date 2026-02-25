@@ -186,8 +186,7 @@ class Noise_Dec_only(nn.Module):
         embed_dim: int,
         embed_pdrob: float,
         goal_seq_len: int,
-        obs_seq_len: int,
-        action_seq_len: int,
+        window_size: int,
         linear_output: bool = True,
         use_pos_emb: bool = True,
         n_layers: int = 6,
@@ -206,19 +205,14 @@ class Noise_Dec_only(nn.Module):
         if not goal_conditioned:
             goal_seq_len = 0
 
-        # Source DiffusionGPT sequence layout expects one state token and one action token per timestep.
-        if action_seq_len != obs_seq_len:
-            raise ValueError(
-                f"Source-style interleaved BESO expects action_seq_len == obs_seq_len, "
-                f"got {action_seq_len=} and {obs_seq_len=}"
-            )
+        self.window_size = window_size
 
         # Source-style token counts:
-        # block_size = [sigma] + [goal_seq_len] + [2 * obs_seq_len]
-        self.block_size = goal_seq_len + 2 * obs_seq_len + 1
+        # block_size = [sigma] + [goal_seq_len] + [2 * window_size]
+        self.block_size = goal_seq_len + 2 * self.window_size + 1
 
         # Position embeddings are defined per goal token and per timestep (state/action share timestep positions).
-        self.seq_size = goal_seq_len + obs_seq_len
+        self.seq_size = goal_seq_len + self.window_size
 
         self.encoder = TransformerEncoder(
             embed_dim=embed_dim,

@@ -148,17 +148,18 @@ class BesoPolicy(PreTrainedPolicy):
 
     def reset(self):
         """Clear observation and action queues. Should be called on env.reset()"""
+        window_size = self.config.window_size
         self._queues = {
-            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "observation.state": deque(maxlen=window_size),
             "action": deque(maxlen=1),
         }
-        self._action_context = deque(maxlen=self.config.n_obs_steps - 1)
+        self._action_context = deque(maxlen=window_size - 1)
 
         if self.config.image_features:
-            self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
+            self._queues["observation.images"] = deque(maxlen=window_size)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(
-                maxlen=self.config.n_obs_steps
+                maxlen=window_size
             )
     
     # ========= inference  ============
@@ -236,7 +237,7 @@ class BesoModel(nn.Module):
         self.sigma_data = config.sigma_data
         self.sigma_max = config.sigma_max
         self.sigma_min = config.sigma_min
-        self.act_seq_len = config.horizon
+        self.window_size = config.window_size
         self.sampling_steps = config.sampling_steps
         self.goal_conditioned = config.goal_conditioned
         self.goal_feature = config.goal_feature
@@ -287,8 +288,7 @@ class BesoModel(nn.Module):
             embed_dim=config.embed_dim,
             embed_pdrob=config.embed_pdrop,
             goal_seq_len=self.config.goal_seq_len,
-            obs_seq_len=self.config.n_obs_steps,
-            action_seq_len=self.config.horizon,
+            window_size=self.window_size,
             linear_output=self.config.linear_output,
             use_pos_emb=self.config.use_pos_emb,
             n_layers=self.config.n_layers,
@@ -338,25 +338,26 @@ class BesoModel(nn.Module):
         global_cond: Tensor | None = None,
         goal_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
-        action_seq_len: int | None = None,
+        T_cur: int | None = None,
         action_context: Tensor | None = None,
     ) -> Tensor:
         # Symbols:
-        #   B=batch_size, T=horizon, A=action_dim, S=n_obs_steps, D_state=D_state_cond, G=goal_seq_len, D_goal=goal_dim
+        #   B=batch_size, T_cur=current action sequence length, S_cur=current observation sequence length,
+        #   A=action_dim, D_state=D_state_cond, G=goal_seq_len, D_goal=goal_dim
         # Inputs:
-        #   global_cond: [B, S, D_state] or None
+        #   global_cond: [B, S_cur, D_state] or None
         #   goal_cond:   [B, G, D_goal] or None
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        if action_seq_len is None:
-            action_seq_len = self.config.horizon
+        if T_cur is None:
+            T_cur = self.window_size
             
         action_dim = self.config.action_feature.shape[0]
         if action_context is None:
             actions = (
                 torch.randn(
-                    size=(batch_size, action_seq_len, action_dim),
+                    size=(batch_size, T_cur, action_dim),
                     dtype=dtype,
                     device=device,
                     generator=generator,
@@ -394,9 +395,9 @@ class BesoModel(nn.Module):
         return actions
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        batch_size, S_cur = batch[OBS_STATE].shape[:2]
         # 1) state as-is
-        state_feats = batch[OBS_STATE]  # (B, S, state_dim)
+        state_feats = batch[OBS_STATE]  # [B, S_cur, D_state]
 
         global_cond_feats = [state_feats]
 
@@ -420,7 +421,7 @@ class BesoModel(nn.Module):
                     img_features_list,
                     "(n b s) ... -> b s (n ...)",
                     b=batch_size,
-                    s=n_obs_steps,
+                    s=S_cur,
                 )
                 # img_features: [B, S, N_cam*D_img]
             else:
@@ -435,7 +436,7 @@ class BesoModel(nn.Module):
                     shared,
                     "(b s n) d -> b s (n d)",
                     b=batch_size,
-                    s=n_obs_steps,
+                    s=S_cur,
                     n=num_cameras,
                 )
                 # img_features: [B, S, N_cam*D_img]
@@ -475,35 +476,26 @@ class BesoModel(nn.Module):
 
                 # Expand to match observation steps and add to conditioning
                 # Shape: (B, S, clip_text_dim)
-                text_features = text_outputs.unsqueeze(1).expand(-1, n_obs_steps, -1)
+                text_features = text_outputs.unsqueeze(1).expand(-1, S_cur, -1)
                 global_cond_feats.append(text_features)
 
         feats = torch.cat(global_cond_feats, dim=-1)
-        # feats / global_cond: [B, S, D_state_cond]
+        # feats / global_cond: [B, S_cur, D_state_cond]
 
         return feats
 
-    def _prepare_goal_conditioning(self, batch: dict[str, Tensor]) -> Tensor | None:
+    def _prepare_goal_conditioning(self, batch):
         if not self.goal_conditioned:
             return None
-
-        # Clean goal interface: [B, G, D_goal]
         goal = batch[self.goal_feature]
-        if goal.ndim != 3:
-            raise ValueError(
-                f"Goal tensor must have shape [B, G, D_goal], got {tuple(goal.shape)}"
-            )
-        if goal.shape[1] != self.config.goal_seq_len:
-            raise ValueError(
-                f"Goal sequence length mismatch: got {goal.shape[1]}, expected {self.config.goal_seq_len}"
-            )
+        assert goal.ndim == 3
         # goal_cond: [B, G, D_goal]
         return goal
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
-        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
-        assert 1 <= n_obs_steps <= self.config.n_obs_steps, (
-            f"Expected 1 <= n_obs_steps <= {self.config.n_obs_steps}, got {n_obs_steps}"
+        batch_size, S_cur = batch["observation.state"].shape[:2]
+        assert 1 <= S_cur <= self.window_size, (
+            f"Expected 1 <= S_cur <= window_size ({self.window_size}), got {S_cur}"
         )
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
@@ -514,7 +506,7 @@ class BesoModel(nn.Module):
             batch_size,
             global_cond=global_cond,
             goal_cond=goal_cond,
-            action_seq_len=n_obs_steps,
+            T_cur=S_cur,
             action_context=action_context,
         )
         # actions: [B, T, A]
@@ -530,7 +522,10 @@ class BesoModel(nn.Module):
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
         assert "observation.images" in batch or "observation.environment_state" in batch
-        n_obs_steps = batch["observation.state"].shape[1]
+        S_cur = batch["observation.state"].shape[1]
+        assert S_cur == self.window_size, (
+            f"Training expects fixed window_size={self.window_size}, got S_cur={S_cur}"
+        )
         global_cond = self._prepare_global_conditioning(batch)  # (B, S, D_state_cond)
         goal_cond = self._prepare_goal_conditioning(batch)
 
