@@ -16,11 +16,19 @@ class RMSNorm(nn.Module):
         return x / norm.clamp(min=self.eps) * self.g
 
 
+def _make_norm(dim: int, norm_type: str, eps: float = 1e-6) -> nn.Module:
+    if norm_type == "rmsnorm":
+        return RMSNorm(dim, eps=eps)
+    if norm_type == "layernorm":
+        return nn.LayerNorm(dim, eps=eps)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
 # SwishGLU -- GLU-style MLP block with SiLU gating.
 class SwishGLU(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int) -> None:
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = False) -> None:
         super().__init__()
-        self.act, self.project = nn.SiLU(), nn.Linear(in_dim, 2 * out_dim)
+        self.act, self.project = nn.SiLU(), nn.Linear(in_dim, 2 * out_dim, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projected, gate = self.project(x).tensor_split(2, dim=-1)
@@ -38,6 +46,7 @@ class Attention(nn.Module):
         causal: bool = False,
         bias=False,
         qk_norm: bool = False,
+        attention_impl: str = "auto",
     ):
         super().__init__()
         assert n_embd % n_head == 0
@@ -50,6 +59,9 @@ class Attention(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
         self.causal = causal
+        if attention_impl not in {"auto", "manual"}:
+            raise ValueError(f"Unsupported attention_impl: {attention_impl}")
+        self.attention_impl = attention_impl
 
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash and causal:
@@ -88,7 +100,8 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        if self.flash:
+        use_sdpa = self.attention_impl == "auto" and self.flash
+        if use_sdpa:
             attn_mask = custom_attn_mask
             if attn_mask is None and self.causal:
                 # Flash attention still uses internal causal path, but we validate length against block_size above.
@@ -122,21 +135,19 @@ class MLP(nn.Module):
         self,
         n_embd: int,
         bias: bool,
-        use_swish: bool = True,
-        use_relus: bool = False,
+        mlp_type: str = "swishglu",
         dropout: float = 0,
     ):
         super().__init__()
         layers = []
 
-        if use_swish:
-            layers.append(SwishGLU(n_embd, 4 * n_embd))
-        else:
+        if mlp_type == "swishglu":
+            layers.append(SwishGLU(n_embd, 4 * n_embd, bias=bias))
+        elif mlp_type == "gelu":
             layers.append(nn.Linear(n_embd, 4 * n_embd, bias=bias))
-            if use_relus:
-                layers.append(nn.ReLU())
-            else:
-                layers.append(nn.GELU())
+            layers.append(nn.GELU())
+        else:
+            raise ValueError(f"Unsupported mlp_type: {mlp_type}")
 
         layers.append(nn.Linear(4 * n_embd, n_embd, bias=bias))
         layers.append(nn.Dropout(dropout))
@@ -157,17 +168,29 @@ class Block(nn.Module):
         mlp_pdrop: float,
         block_size: int = 100,
         causal: bool = True,
-        bias: bool = False,  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+        bias: bool = False,  # Attention output projection bias (kept for backward compatibility).
         qk_norm: bool = True,
+        norm_type: str = "rmsnorm",
+        mlp_type: str = "swishglu",
+        mlp_bias: bool = False,
+        attention_impl: str = "auto",
     ):
         super().__init__()
-        self.ln_1 = RMSNorm(n_embd, eps=1e-6)
+        self.ln_1 = _make_norm(n_embd, norm_type, eps=1e-6)
         self.attn = Attention(
-            n_embd, n_heads, attn_pdrop, resid_pdrop, block_size, causal, bias, qk_norm
+            n_embd,
+            n_heads,
+            attn_pdrop,
+            resid_pdrop,
+            block_size,
+            causal,
+            bias,
+            qk_norm,
+            attention_impl=attention_impl,
         )
 
-        self.ln_2 = RMSNorm(n_embd, eps=1e-6)
-        self.mlp = MLP(n_embd, bias=bias, dropout=mlp_pdrop)
+        self.ln_2 = _make_norm(n_embd, norm_type, eps=1e-6)
+        self.mlp = MLP(n_embd, bias=mlp_bias, mlp_type=mlp_type, dropout=mlp_pdrop)
 
     def forward(self, x, custom_attn_mask=None):
         x = x + self.attn(self.ln_1(x), custom_attn_mask=custom_attn_mask)
@@ -195,6 +218,10 @@ class Noise_Dec_only(nn.Module):
         resid_pdrop: float = 0.0,
         mlp_pdrop: float = 0.0,
         qk_norm: bool = True,
+        norm_type: str = "rmsnorm",
+        mlp_type: str = "swishglu",
+        mlp_bias: bool = False,
+        attention_impl: str = "auto",
         bias: bool = False,
     ):
         super().__init__()
@@ -225,6 +252,10 @@ class Noise_Dec_only(nn.Module):
             qk_norm=qk_norm,
             bias=bias,
             mlp_pdrop=mlp_pdrop,
+            norm_type=norm_type,
+            mlp_type=mlp_type,
+            mlp_bias=mlp_bias,
+            attention_impl=attention_impl,
         )
 
         # linear embedding for the state
@@ -386,6 +417,10 @@ class TransformerEncoder(nn.Module):
         qk_norm: bool = True,
         bias: bool = False,
         mlp_pdrop: float = 0,
+        norm_type: str = "rmsnorm",
+        mlp_type: str = "swishglu",
+        mlp_bias: bool = False,
+        attention_impl: str = "auto",
     ):
         super().__init__()
         self.blocks = nn.Sequential(
@@ -400,11 +435,15 @@ class TransformerEncoder(nn.Module):
                     causal=causal,
                     bias=bias,
                     qk_norm=qk_norm,
+                    norm_type=norm_type,
+                    mlp_type=mlp_type,
+                    mlp_bias=mlp_bias,
+                    attention_impl=attention_impl,
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.ln = RMSNorm(embed_dim, eps=1e-6)
+        self.ln = _make_norm(embed_dim, norm_type, eps=1e-6)
 
     def forward(self, x, custom_attn_mask=None):
         # x: [B, L, E]

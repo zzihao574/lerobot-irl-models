@@ -297,6 +297,10 @@ class BesoModel(nn.Module):
             resid_pdrop=self.config.resid_pdrop,
             mlp_pdrop=self.config.mlp_pdrop,
             qk_norm=self.config.qk_norm,
+            norm_type=self.config.norm_type,
+            mlp_type=self.config.mlp_type,
+            mlp_bias=self.config.mlp_bias,
+            attention_impl=self.config.attention_impl,
         )
         self.device = None
 

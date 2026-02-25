@@ -23,16 +23,20 @@ class BesoConfig(DiffusionConfig):
         resid_pdrop: float = 0.0,
         mlp_pdrop: float = 0.0,
         embed_pdrop: float = 0.0,
-        qk_norm: bool = True,
+        qk_norm: bool = False,
+        norm_type: str = "layernorm", # rmsnorm or layernorm
+        mlp_type: str = "swishglu", # swishglu or gelu
+        mlp_bias: bool = True,
+        attention_impl: str = "auto",
         use_pos_emb: bool = True,
         linear_output: bool = True,
         # RGB encoder parameters (used directly by BesoRgbEncoder)
         vision_backbone: str = "resnet34",
         pretrained_backbone_weights: str | None = "ResNet34_Weights.IMAGENET1K_V1",
         use_group_norm: bool = False,
-        crop_shape: tuple[int, int] | None = (224, 224),
+        crop_shape: tuple[int, int] | None = (192, 192),
         crop_is_random: bool = True,
-        use_separate_rgb_encoder_per_camera: bool = True,
+        use_separate_rgb_encoder_per_camera: bool = False,
         spatial_softmax_num_keypoints: int = 32,
         # EMA
         use_ema: bool = True,
@@ -86,6 +90,14 @@ class BesoConfig(DiffusionConfig):
             )
         if embed_dim % n_heads != 0:
             raise ValueError(f"embed_dim ({embed_dim}) must be divisible by n_heads ({n_heads}).")
+        if norm_type not in {"rmsnorm", "layernorm"}:
+            raise ValueError(f"norm_type must be 'rmsnorm' or 'layernorm', got {norm_type!r}.")
+        if mlp_type not in {"swishglu", "gelu"}:
+            raise ValueError(f"mlp_type must be 'swishglu' or 'gelu', got {mlp_type!r}.")
+        if attention_impl not in {"auto", "manual"}:
+            raise ValueError(
+                f"attention_impl must be 'auto' or 'manual', got {attention_impl!r}."
+            )
         if goal_conditioned and goal_feature is None:
             raise ValueError("Set goal_feature when goal_conditioned=True.")
         if pretrained_backbone_weights is not None and use_group_norm:
@@ -111,6 +123,10 @@ class BesoConfig(DiffusionConfig):
         self.mlp_pdrop = mlp_pdrop
         self.embed_pdrop = embed_pdrop
         self.qk_norm = qk_norm
+        self.norm_type = norm_type
+        self.mlp_type = mlp_type
+        self.mlp_bias = mlp_bias
+        self.attention_impl = attention_impl
         self.use_pos_emb = use_pos_emb
         self.linear_output = linear_output
 

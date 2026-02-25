@@ -11,6 +11,8 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies import factory
 from lerobot.scripts.lerobot_train import train as lerobot_train
 from lerobot.utils.utils import init_logging
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from policies.beso.beso_config import BesoConfig
 
@@ -28,6 +30,7 @@ def train(data_dir="data"):
         "goal_conditioned": False,
         "goal_feature": "observation.goal.tail_q202",
         "goal_seq_len": 1,
+        "use_amp": True,
     }
     pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
     cfg = TrainPipelineConfig(
@@ -42,7 +45,16 @@ def train(data_dir="data"):
     )
 
     init_logging()
-    lerobot_train(cfg)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    force_cpu = pretrained_config.device == "cpu"
+    mixed_precision = "bf16" if pretrained_config.use_amp and not force_cpu else "no"
+    accelerator = Accelerator(
+        step_scheduler_with_optimizer=False,
+        kwargs_handlers=[ddp_kwargs],
+        cpu=force_cpu,
+        mixed_precision=mixed_precision,
+    )
+    lerobot_train(cfg, accelerator=accelerator)
 
 
 def get_beso(_typename: str, **_kwargs):
