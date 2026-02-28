@@ -37,6 +37,7 @@ class BesoConfig(DiffusionConfig):
         crop_shape: tuple[int, int] | None = (192, 192),
         crop_is_random: bool = True,
         use_separate_rgb_encoder_per_camera: bool = False,
+        freeze_rgb_encoder: bool = False,
         spatial_softmax_num_keypoints: int = 32,
         # EMA
         use_ema: bool = True,
@@ -137,6 +138,7 @@ class BesoConfig(DiffusionConfig):
         self.crop_shape = crop_shape
         self.crop_is_random = crop_is_random
         self.use_separate_rgb_encoder_per_camera = use_separate_rgb_encoder_per_camera
+        self.freeze_rgb_encoder = freeze_rgb_encoder
         self.spatial_softmax_num_keypoints = spatial_softmax_num_keypoints
 
         # EMA

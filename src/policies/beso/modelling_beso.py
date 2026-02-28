@@ -259,6 +259,8 @@ class BesoModel(nn.Module):
                 self.rgb_encoder = BesoRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
 
+            self._freeze_rgb_encoder_if_needed()
+
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -314,6 +316,22 @@ class BesoModel(nn.Module):
 
         print("BESO Model Parameter Count:")
         print("=" * 40)
+
+    def _freeze_rgb_encoder_if_needed(self):
+        if not self.config.freeze_rgb_encoder or not hasattr(self, "rgb_encoder"):
+            return
+        if isinstance(self.rgb_encoder, nn.ModuleList):
+            for encoder in self.rgb_encoder:
+                encoder.requires_grad_(False)
+                encoder.eval()
+        else:
+            self.rgb_encoder.requires_grad_(False)
+            self.rgb_encoder.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._freeze_rgb_encoder_if_needed()
+        return self
 
         if hasattr(self, "rgb_encoder"):
             if isinstance(self.rgb_encoder, nn.ModuleList):
@@ -412,42 +430,43 @@ class BesoModel(nn.Module):
         # 2) images -> encoder -> concat cameras
         img_features = None
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(
-                    batch["observation.images"], "b s n ... -> n (b s) ..."
-                )
-                # images_per_camera: [N_cam, B*S, C, H, W]
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(
-                            self.rgb_encoder, images_per_camera, strict=True
-                        )
-                    ]
-                )
-                img_features = einops.rearrange(
-                    img_features_list,
-                    "(n b s) ... -> b s (n ...)",
-                    b=batch_size,
-                    s=S_cur,
-                )
-                # img_features: [B, S, N_cam*D_img]
-            else:
-                num_cameras = len(self.config.image_features)
-                shared = self.rgb_encoder(
-                    einops.rearrange(
-                        batch["observation.images"], "b s n ... -> (b s n) ..."
+            with torch.no_grad() if self.config.freeze_rgb_encoder else torch.enable_grad():
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    images_per_camera = einops.rearrange(
+                        batch["observation.images"], "b s n ... -> n (b s) ..."
                     )
-                )
-                # shared: [B*S*N_cam, D_img]
-                img_features = einops.rearrange(
-                    shared,
-                    "(b s n) d -> b s (n d)",
-                    b=batch_size,
-                    s=S_cur,
-                    n=num_cameras,
-                )
-                # img_features: [B, S, N_cam*D_img]
+                    # images_per_camera: [N_cam, B*S, C, H, W]
+                    img_features_list = torch.cat(
+                        [
+                            encoder(images)
+                            for encoder, images in zip(
+                                self.rgb_encoder, images_per_camera, strict=True
+                            )
+                        ]
+                    )
+                    img_features = einops.rearrange(
+                        img_features_list,
+                        "(n b s) ... -> b s (n ...)",
+                        b=batch_size,
+                        s=S_cur,
+                    )
+                    # img_features: [B, S, N_cam*D_img]
+                else:
+                    num_cameras = len(self.config.image_features)
+                    shared = self.rgb_encoder(
+                        einops.rearrange(
+                            batch["observation.images"], "b s n ... -> (b s n) ..."
+                        )
+                    )
+                    # shared: [B*S*N_cam, D_img]
+                    img_features = einops.rearrange(
+                        shared,
+                        "(b s n) d -> b s (n d)",
+                        b=batch_size,
+                        s=S_cur,
+                        n=num_cameras,
+                    )
+                    # img_features: [B, S, N_cam*D_img]
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:

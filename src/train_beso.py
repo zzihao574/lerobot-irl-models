@@ -32,6 +32,7 @@ def train(data_dir="data"):
         "goal_feature": "observation.goal.tail_q202",
         "goal_seq_len": 1,
         "use_amp": True,
+        "freeze_rgb_encoder": True,
         "drop_n_last_frames": 0,
         "normalization_mapping": {
             "VISUAL": NormalizationMode.MEAN_STD,
