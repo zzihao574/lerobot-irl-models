@@ -17,6 +17,7 @@ from lerobot.processor.normalize_processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 from transformers import CLIPModel, CLIPProcessor
 
@@ -43,30 +44,30 @@ class BesoPolicy(PreTrainedPolicy):
         self,
         config: BesoConfig,
         dataset_meta,
-        dataset_stats,
+        dataset_stats=None,
     ):
         """
         Args:
             config: Policy configuration class instance or None, in which case the default instantiation of
                 the configuration class is used.
-            dataset_meta: LeRobot dataset metadata. We use dataset_meta.stats for normalization stats.
-            dataset_stats: Passed by LeRobot factory as well (unused here; kept for exact factory compatibility).
+            dataset_meta: LeRobot dataset metadata.
+            dataset_stats: Optional explicit normalization stats override.
         """
         super().__init__(config)
         config.validate_features()
         self.config = config
-        dataset_stats = dataset_meta.stats
+        norm_stats = dataset_stats if dataset_stats is not None else dataset_meta.stats
         self.normalize_inputs = NormalizerProcessorStep(
-            config.input_features, config.normalization_mapping, dataset_stats
+            config.input_features, config.normalization_mapping, norm_stats
         )
         self.normalize_targets = NormalizerProcessorStep(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features, config.normalization_mapping, norm_stats
         )
         self.unnormalize_outputs = UnnormalizerProcessorStep(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features, config.normalization_mapping, norm_stats
         )
         self.unnormalize_inputs = UnnormalizerProcessorStep(
-            config.input_features, config.normalization_mapping, dataset_stats
+            config.input_features, config.normalization_mapping, norm_stats
         )
         self.step_counter = 0
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
@@ -118,10 +119,15 @@ class BesoPolicy(PreTrainedPolicy):
         if self._ema_updates % self.config.ema_update_every_n_steps == 0:
             self._ema_helper.update(self.diffusion.parameters())
 
+    def _save_non_ema_weights(self, save_directory):
+        model_to_save = self.module if hasattr(self, "module") else self
+        save_model_as_safetensor(model_to_save, str(save_directory / "model_non_ema.safetensors"))
+
     def _save_pretrained(self, save_directory):
-        # Save EMA weights for checkpoints to match BESO source behavior.
+        # Save both non-EMA and EMA weights for checkpoints.
         if self._ema_helper is None or self._ema_applied_for_eval:
             return super()._save_pretrained(save_directory)
+        self._save_non_ema_weights(save_directory)
         self._store_original_weights_and_apply_ema()
         try:
             return super()._save_pretrained(save_directory)
@@ -182,7 +188,7 @@ class BesoPolicy(PreTrainedPolicy):
                 queued_batch[key] = value
 
         norm_actions = self.diffusion.generate_actions(queued_batch)
-        norm_actions = torch.clamp(norm_actions, -1.0, 1.0)
+        norm_actions = torch.clamp(norm_actions, -1.1, 1.1)
         env_actions = self.unnormalize_outputs({ACTION: norm_actions})[ACTION]
         return norm_actions, env_actions
 
@@ -215,7 +221,6 @@ class BesoPolicy(PreTrainedPolicy):
     # ========= training  ============
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(
                 batch
@@ -223,8 +228,7 @@ class BesoPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
-
-        batch = self.normalize_targets(batch)
+        # In lerobot_train, `preprocessor(batch)` already applies normalization for
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None

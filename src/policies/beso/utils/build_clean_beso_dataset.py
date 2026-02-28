@@ -4,11 +4,12 @@
 """
 Build a clean LeRobot dataset for BESO training:
 1) Merge sub-datasets in a fixed order (reindex episode_index/index/task_index correctly)
-2) Add standard keys:
+2) Split merged raw dataset into train/eval subsets
+3) For each split, add standard keys:
    - observation.state = concat(q202, prev_gripper_action202)
    - action = concat(action_q202, action_gripper202)
    - observation.goal.tail_q202 = per-episode fixed tail goal, repeated on every frame (shape [1, D_goal])
-3) Remove old split keys (do not keep legacy keys)
+4) Remove old split keys (do not keep legacy keys)
 
 Notes:
 - This script intentionally uses LeRobot official offline dataset tools.
@@ -20,11 +21,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 def _parse_args():
@@ -51,7 +54,7 @@ def _parse_args():
         "--output-root",
         type=str,
         default="/home/zzh/workspace/Robot_learning/datasets_robot/banana_beso_clean_v1",
-        help="Final cleaned dataset root.",
+        help="Only used for its parent directory, where banana_beso_train/eval are written.",
     )
     ap.add_argument(
         "--output-repo-id",
@@ -62,7 +65,7 @@ def _parse_args():
     ap.add_argument(
         "--tail-ratio",
         type=float,
-        default=0.8,
+        default=0.9,
         help="Use the last (1-tail_ratio) portion of each episode to compute goal.",
     )
     ap.add_argument(
@@ -83,17 +86,38 @@ def _parse_args():
         action="store_true",
         help="Keep temporary merged raw dataset instead of deleting it.",
     )
+    ap.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Random seed used when sampling eval episodes.",
+    )
     return ap.parse_args()
 
 
 def _canonical_source_order(root: Path) -> list[Path]:
     # Fixed order to avoid episode_index ambiguity and to make aggregation deterministic.
-    names = [f"place_{i}" for i in range(1, 9)] + ["0-9 freestyle", "10-13 freestyle"]
-    paths = [root / n for n in names]
+    alias_groups = [[f"place_{i}"] for i in range(1, 9)] + [
+        ["0-9_freestyle", "0-9 freestyle", "0-9_ freestyle"],
+        ["10-13_freestyle", "10-13 freestyle", "10-13_ freestyle"],
+    ]
+    paths: list[Path] = []
+    missing_groups: list[list[str]] = []
+    for aliases in alias_groups:
+        matched = None
+        for name in aliases:
+            p = root / name
+            if p.exists():
+                matched = p
+                break
+        if matched is None:
+            missing_groups.append(aliases)
+        else:
+            paths.append(matched)
 
-    missing = [str(p) for p in paths if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing dataset folders: {missing}")
+    if missing_groups:
+        missing_str = ["/".join(group) for group in missing_groups]
+        raise FileNotFoundError(f"Missing dataset folders (any alias works): {missing_str}")
 
     return paths
 
@@ -280,6 +304,216 @@ def _recompute_added_feature_stats(clean_dataset, goal_key: str) -> None:
     print("[INFO] added/updated stats keys:", list(new_stats.keys()))
 
 
+def _sample_train_eval_episodes(total_episodes: int, seed: int) -> tuple[list[int], list[int]]:
+    eval_count = 5
+    if total_episodes <= eval_count:
+        raise ValueError(
+            f"Need more than {eval_count} episodes to create train/eval datasets, got {total_episodes}."
+        )
+
+    rng = random.Random(seed)
+    all_episodes = list(range(total_episodes))
+    eval_episodes = sorted(rng.sample(all_episodes, k=eval_count))
+    eval_set = set(eval_episodes)
+    train_episodes = [ep for ep in all_episodes if ep not in eval_set]
+    return train_episodes, eval_episodes
+
+
+def _write_split_manifest(split_root: Path, split_name: str, kept_old_episodes: list[int]) -> None:
+    payload = {
+        "split": split_name,
+        "num_episodes": len(kept_old_episodes),
+        "new_to_old_episode_index": kept_old_episodes,
+        "old_to_new_episode_index": {str(old): new for new, old in enumerate(kept_old_episodes)},
+    }
+    with open(split_root / "split_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] wrote split manifest: {split_root / 'split_manifest.json'}")
+
+
+def _restore_split_video_alignment(
+    merged_dataset,
+    split_root: Path,
+    kept_old_episodes: list[int],
+    split_name: str,
+) -> None:
+    """
+    Keep split videos strictly aligned with merged raw dataset:
+    - copy original video files from merged dataset (no partial re-encode)
+    - restore per-episode from/to timestamps in meta/episodes from merged metadata
+    """
+    video_keys = list(merged_dataset.meta.video_keys)
+    if not video_keys:
+        return
+
+    # 1) Copy original video files used by kept episodes.
+    rel_video_paths = set()
+    for old_ep in kept_old_episodes:
+        for video_key in video_keys:
+            rel_video_paths.add(merged_dataset.meta.get_video_file_path(old_ep, video_key))
+
+    for rel_path in sorted(rel_video_paths):
+        src = merged_dataset.root / rel_path
+        dst = split_root / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+    # 2) Patch split episode metadata video fields back to merged timestamps.
+    new_to_old = {new: old for new, old in enumerate(kept_old_episodes)}
+    episodes_dir = split_root / "meta" / "episodes"
+    episode_files = sorted(episodes_dir.glob("*/*.parquet"))
+
+    for ep_file in episode_files:
+        df = pd.read_parquet(ep_file)
+        ep_series = df["episode_index"].astype(int)
+
+        for video_key in video_keys:
+            chunk_col = f"videos/{video_key}/chunk_index"
+            file_col = f"videos/{video_key}/file_index"
+            from_col = f"videos/{video_key}/from_timestamp"
+            to_col = f"videos/{video_key}/to_timestamp"
+
+            df[chunk_col] = ep_series.map(
+                lambda new_ep: int(merged_dataset.meta.episodes[new_to_old[int(new_ep)]][chunk_col])
+            )
+            df[file_col] = ep_series.map(
+                lambda new_ep: int(merged_dataset.meta.episodes[new_to_old[int(new_ep)]][file_col])
+            )
+            df[from_col] = ep_series.map(
+                lambda new_ep: float(merged_dataset.meta.episodes[new_to_old[int(new_ep)]][from_col])
+            )
+            df[to_col] = ep_series.map(
+                lambda new_ep: float(merged_dataset.meta.episodes[new_to_old[int(new_ep)]][to_col])
+            )
+
+        df.to_parquet(ep_file, index=False)
+
+    print(f"[INFO] restored video alignment for split={split_name}")
+
+
+def _build_clean_dataset(
+    source_dataset,
+    output_root: Path,
+    output_repo_id: str,
+    tail_ratio: float,
+    goal_reduce: str,
+    goal_key: str,
+):
+    from lerobot.datasets.dataset_tools import modify_features
+
+    episode_to_action, episode_to_state, episode_to_goal = _build_episode_tables(
+        source_dataset,
+        tail_ratio=tail_ratio,
+        goal_reduce=goal_reduce,
+    )
+
+    def action_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
+        return episode_to_action[int(ep_idx)][int(frame_in_ep)].tolist()
+
+    def obs_state_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
+        return episode_to_state[int(ep_idx)][int(frame_in_ep)].tolist()
+
+    def goal_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
+        goal_vec = episode_to_goal[int(ep_idx)]
+        return [goal_vec.tolist()]
+
+    add_features = {
+        "action": (
+            action_feature_fn,
+            {
+                "dtype": "float32",
+                "shape": [8],
+                "names": None,
+            },
+        ),
+        "observation.state": (
+            obs_state_feature_fn,
+            {
+                "dtype": "float32",
+                "shape": [8],
+                "names": None,
+            },
+        ),
+        goal_key: (
+            goal_feature_fn,
+            {
+                "dtype": "float32",
+                "shape": [1, 7],
+                "names": None,
+            },
+        ),
+    }
+
+    remove_features = [
+        "observation.state.q.Panda201",
+        "observation.state.q.Panda202",
+        "observation.state.gripper.width.PandaGripper201",
+        "action.q.Panda202",
+        "action.gripper_width.PandaGripper202",
+    ]
+
+    if output_root.exists():
+        raise FileExistsError(f"Output root already exists: {output_root}")
+
+    print(f"[INFO] Writing cleaned dataset to: {output_root}")
+    clean_dataset = modify_features(
+        dataset=source_dataset,
+        add_features=add_features,
+        remove_features=remove_features,
+        output_dir=output_root,
+        repo_id=output_repo_id,
+    )
+
+    _patch_visual_feature_names_if_missing(clean_dataset.root)
+    _recompute_added_feature_stats(clean_dataset, goal_key)
+
+    print("[INFO] Clean dataset created.")
+    print(f"[INFO] repo_id={clean_dataset.repo_id}")
+    print(f"[INFO] root={clean_dataset.root}")
+    print(f"[INFO] total_episodes={clean_dataset.meta.total_episodes}, total_frames={clean_dataset.meta.total_frames}")
+    print("[INFO] Final feature keys:")
+    for k in clean_dataset.meta.features.keys():
+        print(f"  - {k}")
+
+    return clean_dataset
+
+
+def _split_train_eval_raw_datasets(merged_dataset, datasets_root: Path, seed: int):
+    from lerobot.datasets.dataset_tools import delete_episodes
+
+    total_episodes = int(merged_dataset.meta.total_episodes)
+    train_episodes, eval_episodes = _sample_train_eval_episodes(total_episodes, seed)
+    print(f"[INFO] sampled eval episodes in merged dataset={eval_episodes}")
+
+    train_raw_root = datasets_root / "_tmp_beso_train_raw"
+    eval_raw_root = datasets_root / "_tmp_beso_eval_raw"
+    if train_raw_root.exists():
+        raise FileExistsError(f"Temporary train raw root already exists: {train_raw_root}")
+    if eval_raw_root.exists():
+        raise FileExistsError(f"Temporary eval raw root already exists: {eval_raw_root}")
+
+    train_raw = delete_episodes(
+        dataset=merged_dataset,
+        episode_indices=eval_episodes,
+        output_dir=train_raw_root,
+        repo_id="banana_beso_train_raw_tmp",
+    )
+    eval_raw = delete_episodes(
+        dataset=merged_dataset,
+        episode_indices=train_episodes,
+        output_dir=eval_raw_root,
+        repo_id="banana_beso_eval_raw_tmp",
+    )
+    return (
+        train_raw,
+        eval_raw,
+        train_raw_root,
+        eval_raw_root,
+        train_episodes,
+        eval_episodes,
+    )
+
+
 def main():
     args = _parse_args()
 
@@ -289,10 +523,12 @@ def main():
         raise FileNotFoundError(f"--lerobot-src not found: {lerobot_src}")
     sys.path.insert(0, str(lerobot_src))
 
-    from lerobot.datasets.dataset_tools import merge_datasets, modify_features
+    from lerobot.datasets.dataset_tools import merge_datasets
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     datasets_root = Path(args.datasets_root)
+    output_root = Path(args.output_root)
+
     source_paths = _canonical_source_order(datasets_root)
 
     # 1) Load source datasets in a fixed order
@@ -333,93 +569,57 @@ def main():
     if uniq_eps.tolist() != list(range(len(uniq_eps))):
         raise ValueError("Aggregated episode_index is not contiguous after merge; stop and inspect.")
 
-    # 3) Precompute per-episode derived features on the merged dataset
-    episode_to_action, episode_to_state, episode_to_goal = _build_episode_tables(
-        merged_dataset,
+    # 3) Split merged raw dataset first (avoids pandas bug when splitting after derived-feature injection)
+    train_raw, eval_raw, train_raw_root, eval_raw_root, train_episodes, eval_episodes = _split_train_eval_raw_datasets(
+        merged_dataset=merged_dataset,
+        datasets_root=datasets_root,
+        seed=args.split_seed,
+    )
+
+    _restore_split_video_alignment(
+        merged_dataset=merged_dataset,
+        split_root=train_raw_root,
+        kept_old_episodes=train_episodes,
+        split_name="train",
+    )
+    _restore_split_video_alignment(
+        merged_dataset=merged_dataset,
+        split_root=eval_raw_root,
+        kept_old_episodes=eval_episodes,
+        split_name="eval",
+    )
+    _write_split_manifest(train_raw_root, "train_raw", train_episodes)
+    _write_split_manifest(eval_raw_root, "eval_raw", eval_episodes)
+
+    # 4) Build final clean train/eval datasets
+    train_root = output_root.parent / "banana_beso_train"
+    eval_root = output_root.parent / "banana_beso_eval"
+    _build_clean_dataset(
+        source_dataset=train_raw,
+        output_root=train_root,
+        output_repo_id="banana_beso_train",
         tail_ratio=args.tail_ratio,
         goal_reduce=args.goal_reduce,
+        goal_key=args.goal_key,
     )
-
-    # 4) Add new features + remove old split keys in ONE pass
-    # NOTE: We use callables (not raw [N,D] arrays) because modify_features writes one parquet column
-    # and direct 2D numpy assignment to a single pandas column can fail.
-    def action_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
-        # Returns [8]
-        return episode_to_action[int(ep_idx)][int(frame_in_ep)].tolist()
-
-    def obs_state_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
-        # Returns [8]
-        return episode_to_state[int(ep_idx)][int(frame_in_ep)].tolist()
-
-    def goal_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
-        # Returns [1, 7] so batch becomes [B, 1, 7] (clean B,G,D_goal interface)
-        goal_vec = episode_to_goal[int(ep_idx)]  # [7]
-        return [goal_vec.tolist()]               # [1, 7]
-
-    add_features = {
-        "action": (
-            action_feature_fn,
-            {
-                "dtype": "float32",
-                "shape": [8],
-                "names": None,
-            },
-        ),
-        "observation.state": (
-            obs_state_feature_fn,
-            {
-                "dtype": "float32",
-                "shape": [8],
-                "names": None,
-            },
-        ),
-        args.goal_key: (
-            goal_feature_fn,
-            {
-                "dtype": "float32",
-                "shape": [1, 7],
-                "names": None,
-            },
-        ),
-    }
-
-    # Remove legacy split keys (keep images + timestamp/frame/episode/index/task_index)
-    remove_features = [
-        "observation.state.q.Panda201",
-        "observation.state.q.Panda202",
-        "observation.state.gripper.width.PandaGripper201",
-        "action.q.Panda202",
-        "action.gripper_width.PandaGripper202",
-    ]
-
-    output_root = Path(args.output_root)
-    if output_root.exists():
-        raise FileExistsError(f"Final output root already exists: {output_root}")
-
-    print(f"[INFO] Writing cleaned dataset to: {output_root}")
-    clean_dataset = modify_features(
-        dataset=merged_dataset,
-        add_features=add_features,
-        remove_features=remove_features,
-        output_dir=output_root,
-        repo_id=args.output_repo_id,
+    _build_clean_dataset(
+        source_dataset=eval_raw,
+        output_root=eval_root,
+        output_repo_id="banana_beso_eval",
+        tail_ratio=args.tail_ratio,
+        goal_reduce=args.goal_reduce,
+        goal_key=args.goal_key,
     )
+    _write_split_manifest(train_root, "train", train_episodes)
+    _write_split_manifest(eval_root, "eval", eval_episodes)
 
-    # 4.1) Patch visual feature metadata for compatibility with some LeRobot versions.
-    _patch_visual_feature_names_if_missing(clean_dataset.root)
+    # 5) Remove split raw temporary datasets
+    print(f"[INFO] Removing temporary train raw dataset: {train_raw_root}")
+    shutil.rmtree(train_raw_root, ignore_errors=True)
+    print(f"[INFO] Removing temporary eval raw dataset: {eval_raw_root}")
+    shutil.rmtree(eval_raw_root, ignore_errors=True)
 
-    # 4.2) Recompute stats for newly added numeric vector features.
-    _recompute_added_feature_stats(clean_dataset, args.goal_key)
-
-    print("[INFO] Clean dataset created.")
-    print(f"[INFO] repo_id={clean_dataset.repo_id}")
-    print(f"[INFO] root={clean_dataset.root}")
-    print(f"[INFO] total_episodes={clean_dataset.meta.total_episodes}, total_frames={clean_dataset.meta.total_frames}")
-    print("[INFO] Final feature keys:")
-    for k in clean_dataset.meta.features.keys():
-        print(f"  - {k}")
-
-    # 5) Optional cleanup of temp merged dataset
+    # 6) Optional cleanup of temp merged dataset
     if not args.keep_temp_merged:
         print(f"[INFO] Removing temporary merged dataset: {merged_tmp_root}")
         shutil.rmtree(merged_tmp_root, ignore_errors=True)

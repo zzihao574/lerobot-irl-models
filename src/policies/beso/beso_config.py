@@ -25,7 +25,7 @@ class BesoConfig(DiffusionConfig):
         embed_pdrop: float = 0.0,
         qk_norm: bool = False,
         norm_type: str = "layernorm", # rmsnorm or layernorm
-        mlp_type: str = "swishglu", # swishglu or gelu
+        mlp_type: str = "gelu", # swishglu or gelu
         mlp_bias: bool = True,
         attention_impl: str = "auto",
         use_pos_emb: bool = True,

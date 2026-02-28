@@ -8,6 +8,7 @@ os.environ["HF_DATASETS_CACHE"] = str(_HF_DATASETS_CACHE)
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.types import NormalizationMode
 from lerobot.policies import factory
 from lerobot.scripts.lerobot_train import train as lerobot_train
 from lerobot.utils.utils import init_logging
@@ -16,14 +17,14 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 from policies.beso.beso_config import BesoConfig
 
-
 def train(data_dir="data"):
     print("\nStarting training...")
     dataset_cfg = DatasetConfig(
-        repo_id="banana_beso_clean_v1",
+        repo_id=pathlib.Path(data_dir).name,
         root=data_dir,
         video_backend="torchcodec",
     )
+
     policy_overrides = {
         # Experiment overrides on top of BesoConfig defaults.
         "window_size": 4,
@@ -31,8 +32,15 @@ def train(data_dir="data"):
         "goal_feature": "observation.goal.tail_q202",
         "goal_seq_len": 1,
         "use_amp": True,
+        "drop_n_last_frames": 0,
+        "normalization_mapping": {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.MIN_MAX,
+        },
     }
     pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
+    print(f"[INFO] normalization_mapping={pretrained_config.normalization_mapping}")
     cfg = TrainPipelineConfig(
         policy=pretrained_config,
         dataset=dataset_cfg,
