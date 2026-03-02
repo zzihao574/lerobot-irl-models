@@ -603,14 +603,33 @@ class BesoModel(nn.Module):
             append_dims(x, trajectory.ndim) for x in self.get_scalings(sigmas)
         ]
         # c_skip, c_out, c_in: [B, 1, 1] (broadcast to [B, T, A])
-        noised_input = trajectory + noise * append_dims(sigmas, trajectory.ndim)
-        # noised_input: [B, T, A]
-        model_output = self.dit_backbone(global_cond, noised_input * c_in, goal_cond, sigmas)
+
+        # Only noise the LAST timestep to match eval behaviour:
+        # eval feeds [clean_t1, ..., clean_{T-1}, noisy_tT] to the model.
+        noise_mask = torch.zeros_like(trajectory)
+        noise_mask[:, -1:, :] = 1.0  # [B, T, A] — only last step is noised
+        noised_input = trajectory + noise * append_dims(sigmas, trajectory.ndim) * noise_mask
+        # noised_input: [B, T, A]  (first T-1 steps are clean, last step is noised)
+
+        # c_in(sigma=10) ≈ 0.1. Scaling clean history by this crushes its amplitude to ~10%,
+        # making the transformer unable to read past context → collapses to mean prediction.
+        # For clean steps sigma=0, so c_in(0) = 1/sigma_data = 1.0 (when sigma_data=1).
+        c_in_history = 1.0 / (self.sigma_data ** 2) ** 0.5  # =1.0 when sigma_data=1
+        scaled_input = torch.cat([
+            noised_input[:, :-1, :] * c_in_history,  # clean history: keep full amplitude
+            noised_input[:, -1:, :] * c_in,          # noisy last step: scale by actual sigma
+        ], dim=1)
+
+        model_output = self.dit_backbone(global_cond, scaled_input, goal_cond, sigmas)
         # model_output: [B, T, A]
-        target = (trajectory - c_skip * noised_input) / c_out
-        # target: [B, T, A]
-        
-        loss = F.mse_loss(model_output, target, reduction="none")
+        # EDM target is only meaningful for the noisy last step
+        noised_last = noised_input[:, -1:, :]  # [B, 1, A]
+        clean_last  = trajectory[:, -1:, :]   # [B, 1, A]
+        target_last = (clean_last - c_skip * noised_last) / c_out  # [B, 1, A]
+
+        # Supervise only the last (noisy) step
+        loss = F.mse_loss(model_output[:, -1:, :], target_last, reduction="none")
+        # loss: [B, 1, A]
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
@@ -620,7 +639,8 @@ class BesoModel(nn.Module):
                     f"{self.config.do_mask_loss_for_padding=}."
                 )
             in_episode_bound = ~batch["action_is_pad"]
-            loss = loss * in_episode_bound.unsqueeze(-1)
+            # action_is_pad: [B, T] — use last timestep's pad flag
+            loss = loss * in_episode_bound[:, -1:].unsqueeze(-1)
         loss = loss.mean()
         return loss
 
@@ -634,7 +654,35 @@ class BesoModel(nn.Module):
         c_skip, c_out, c_in = [
             append_dims(x, action.ndim) for x in self.get_scalings(sigma)
         ]
-        return self.dit_backbone(state, action * c_in, goal, sigma, uncond=uncond) * c_out + action * c_skip
+        # action = [clean_t0..t_{T-2}, noisy_t_{T-1}]
+        # Use per-position EDM coefficients matching the actual sigma of each slot:
+        #   clean history: sigma=0 → c_in=1/σ_d=1.0, c_skip=1.0, c_out=0.0
+        #   noisy last:    sigma=σ → c_in, c_skip, c_out at their normal values
+        # This ensures clean history is preserved exactly across every DDIM step.
+        c_in_h   = 1.0 / (self.sigma_data ** 2) ** 0.5  # c_in(sigma=0)  = 1.0
+        c_skip_h = 1.0                                    # c_skip(sigma=0)= 1.0
+        # c_out(sigma=0) = 0.0 → network output contributes nothing to clean history slots
+
+        scaled_action = torch.cat([
+            action[:, :-1, :] * c_in_h,   # clean history
+            action[:, -1:, :] * c_in,     # noisy last step
+        ], dim=1)
+
+        net_out = self.dit_backbone(state, scaled_action, goal, sigma, uncond=uncond)
+
+        # Per-position skip connection
+        skip = torch.cat([
+            action[:, :-1, :] * c_skip_h,  # clean history: ×1.0, kept as-is
+            action[:, -1:, :] * c_skip,     # noisy last: ×c_skip(σ)
+        ], dim=1)
+
+        # Per-position network contribution: zero for clean history, c_out-scaled for last step
+        net_contribution = torch.cat([
+            torch.zeros_like(action[:, :-1, :]),  # history contributes nothing
+            net_out[:, -1:, :] * c_out,           # last step
+        ], dim=1)
+
+        return net_contribution + skip
 
     # Preconditioned denoiser wrapper used by sample_ddim.
     def forward(self, state, action, goal, sigma, uncond: bool=False, cond_lambda: float | None = None):
