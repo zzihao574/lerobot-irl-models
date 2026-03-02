@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from tqdm import tqdm
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]
@@ -17,12 +18,12 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from policies.beso.beso_config import BesoConfig  # noqa: F401
+from lerobot.configs.policies import PreTrainedConfig
+from policies.beso.beso_config import BesoConfig, BESO_CONFIG_NAME  # noqa: F401
 from policies.beso.modelling_beso import BesoPolicy
 
-# Hardcoded rollout settings
+# Hardcoded rollout setting
 VIDEO_BACKEND = "torchcodec"
-INIT_PREV_GRIPPER = 0.07
 
 log = logging.getLogger(__name__)
 
@@ -60,28 +61,21 @@ def _parse_args():
     ap.add_argument("--all-checkpoints", action="store_true")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument(
-        "--eval-mode",
-        type=str,
-        default="both",
-        choices=["rollout", "one_step", "both"],
-    )
-    ap.add_argument(
-        "--state7-mode",
-        type=str,
-        default="pred",
-        choices=["pred", "gt"],
-    )
-    ap.add_argument(
-        "--gt-shift",
-        type=int,
-        default=0,
-        choices=[-1, 0, 1],
-        help="Compare pred at t with gt at t+gt_shift.",
-    )
-    ap.add_argument(
-        "--scan-gt-shift",
+        "--use-non-ema",
         action="store_true",
-        help="Run all gt shifts in {-1,0,+1} and report each.",
+        help="Load model_non_ema.safetensors instead of model.safetensors.",
+    )
+    ap.add_argument(
+        "--state-only",
+        action="store_true",
+        help="Force loading checkpoint as state-only policy.",
+    )
+    ap.add_argument(
+        "--actual-image-input",
+        type=str,
+        default="True",
+        choices=["True", "None"],
+        help="True: use original image input. None: replace visual inputs with zeros.",
     )
     return ap.parse_args()
 
@@ -130,29 +124,79 @@ def _collect_pretrained_dirs(checkpoint_path: Path, all_checkpoints: bool) -> li
     return out
 
 
-def _shift_tag(gt_shift: int) -> str:
-    if gt_shift < 0:
-        return f"m{abs(gt_shift)}"
-    return f"p{gt_shift}"
-
-
-def _get_shifted_gt_action(
-    dataset: LeRobotDataset,
-    start: int,
-    end: int,
-    abs_idx: int,
-    gt_shift: int,
-    device: torch.device,
-    frame_at_abs_idx: dict | None = None,
-) -> torch.Tensor | None:
-    gt_idx = abs_idx + gt_shift
-    if gt_idx < start or gt_idx >= end:
+def _parse_actual_image_input(value: str) -> bool | None:
+    if value == "True":
+        return True
+    if value == "None":
         return None
-    if gt_shift == 0 and frame_at_abs_idx is not None:
-        gt_frame = frame_at_abs_idx
+    raise ValueError(f"Unsupported actual_image_input value: {value!r}")
+
+
+def _infer_pos_emb_seq_len_from_checkpoint(pretrained_dir: Path) -> int | None:
+    model_path = pretrained_dir / "model.safetensors"
+    if not model_path.exists():
+        return None
+    key = "diffusion.dit_backbone.pos_emb"
+    with safe_open(str(model_path), framework="pt", device="cpu") as f:
+        if key not in f.keys():
+            return None
+        shape = tuple(f.get_tensor(key).shape)
+    if len(shape) != 3:
+        return None
+    return int(shape[1])
+
+
+def _infer_goal_feature_from_cfg(cfg) -> str | None:
+    input_features = getattr(cfg, "input_features", None)
+    if input_features is None:
+        return None
+    for k in input_features.keys():
+        if str(k).startswith("observation.goal"):
+            return str(k)
+    return None
+
+
+def _align_cfg_with_checkpoint_arch(cfg, pretrained_dir: Path) -> None:
+    pos_seq_len = _infer_pos_emb_seq_len_from_checkpoint(pretrained_dir)
+    n_obs_steps = getattr(cfg, "n_obs_steps", None)
+    if pos_seq_len is None or n_obs_steps is None:
+        return
+
+    n_obs_steps = int(n_obs_steps)
+    if pos_seq_len <= n_obs_steps:
+        if hasattr(cfg, "goal_conditioned"):
+            cfg.goal_conditioned = False
+        if hasattr(cfg, "goal_seq_len"):
+            cfg.goal_seq_len = 0
+        return
+
+    goal_seq_len = pos_seq_len - n_obs_steps
+    if hasattr(cfg, "goal_conditioned"):
+        cfg.goal_conditioned = True
+    if hasattr(cfg, "goal_seq_len"):
+        cfg.goal_seq_len = goal_seq_len
+    if getattr(cfg, "goal_feature", None) in (None, ""):
+        goal_feature = _infer_goal_feature_from_cfg(cfg)
+        if goal_feature is not None:
+            cfg.goal_feature = goal_feature
+
+    log.info(
+        "Aligned ckpt arch: n_obs_steps=%d, pos_emb_seq_len=%d, goal_seq_len=%d, goal_feature=%s",
+        n_obs_steps,
+        pos_seq_len,
+        goal_seq_len,
+        getattr(cfg, "goal_feature", None),
+    )
+
+
+def _is_visual_feature(feature_def) -> bool:
+    if isinstance(feature_def, dict):
+        t = feature_def.get("type")
     else:
-        gt_frame = dataset[gt_idx]
-    return gt_frame["action"].to(device=device, dtype=torch.float32)
+        t = getattr(feature_def, "type", None)
+    if t is None:
+        return False
+    return str(getattr(t, "value", t)).upper() == "VISUAL"
 
 
 @dataclass
@@ -285,39 +329,18 @@ class RolloutMetricsAccumulator:
         return out
 
 
-class BesoRolloutStateAdapter:
-    def __init__(self, mode: str, init_prev_gripper: float = INIT_PREV_GRIPPER):
-        self.mode = mode
-        self.init_prev_gripper = float(init_prev_gripper)
-        self.prev_gripper = self.init_prev_gripper
-
-    def reset(self):
-        self.prev_gripper = self.init_prev_gripper
-
-    def build_obs_state(self, frame_state: torch.Tensor) -> torch.Tensor:
-        if self.mode == "gt":
-            return frame_state.float()
-        out = frame_state.clone().float()
-        out[7] = self.prev_gripper
-        return out
-
-    def update_from_pred_action(self, pred_action: torch.Tensor):
-        if self.mode == "gt":
-            return
-        self.prev_gripper = float(pred_action[7].item())
-
-
 def _build_policy_input_for_frame(
     frame: dict,
     policy: BesoPolicy,
     device: torch.device,
-    state_adapter: BesoRolloutStateAdapter,
+    actual_image_input: bool | None,
 ) -> dict[str, torch.Tensor]:
     batch = {}
     for key in policy.config.input_features.keys():
         if key == "observation.state":
-            obs_state = state_adapter.build_obs_state(frame["observation.state"])
-            batch[key] = obs_state.unsqueeze(0).to(device)
+            batch[key] = frame["observation.state"].unsqueeze(0).to(device)
+        elif _is_visual_feature(policy.config.input_features[key]) and actual_image_input is None:
+            batch[key] = torch.zeros_like(frame[key]).unsqueeze(0).to(device)
         else:
             batch[key] = frame[key].unsqueeze(0).to(device)
     return batch
@@ -328,15 +351,13 @@ def run_episode_rollout(
     policy: BesoPolicy,
     dataset: LeRobotDataset,
     episode_idx: int,
-    state_adapter: BesoRolloutStateAdapter,
     metrics: RolloutMetricsAccumulator,
     device: torch.device,
-    gt_shift: int,
+    actual_image_input: bool | None,
 ):
     start, end = _episode_bounds(dataset, episode_idx)
 
     policy.reset()
-    state_adapter.reset()
     window_size = policy.config.window_size
 
     for t, abs_idx in enumerate(
@@ -354,26 +375,14 @@ def run_episode_rollout(
             frame=frame,
             policy=policy,
             device=device,
-            state_adapter=state_adapter,
+            actual_image_input=actual_image_input,
         )
 
         pred_action = policy.select_action(policy_input)
         if pred_action.ndim == 2:
             pred_action = pred_action[0]
         pred_action = pred_action.to(device=device, dtype=torch.float32)
-
-        state_adapter.update_from_pred_action(pred_action)
-        gt_action = _get_shifted_gt_action(
-            dataset=dataset,
-            start=start,
-            end=end,
-            abs_idx=abs_idx,
-            gt_shift=gt_shift,
-            device=device,
-            frame_at_abs_idx=frame,
-        )
-        if gt_action is None:
-            continue
+        gt_action = frame["action"].to(device=device, dtype=torch.float32)
         metrics.add_step(
             diff=pred_action - gt_action,
             t=t,
@@ -390,13 +399,11 @@ def run_rollout_eval(
     policy: BesoPolicy,
     dataset: LeRobotDataset,
     eval_episode_indices: list[int],
-    state7_mode: str,
     device: torch.device,
-    gt_shift: int,
+    actual_image_input: bool | None,
 ) -> dict[str, float]:
     policy.eval()
     metrics = RolloutMetricsAccumulator(prefix="rollout")
-    adapter = BesoRolloutStateAdapter(mode=state7_mode, init_prev_gripper=INIT_PREV_GRIPPER)
 
     for ep in tqdm(eval_episode_indices, desc="episodes", unit="ep"):
         log.info("Rollout eval episode %d", ep)
@@ -404,168 +411,68 @@ def run_rollout_eval(
             policy=policy,
             dataset=dataset,
             episode_idx=ep,
-            state_adapter=adapter,
             metrics=metrics,
             device=device,
-            gt_shift=gt_shift,
+            actual_image_input=actual_image_input,
         )
 
     return metrics.finalize()
 
 
 @torch.no_grad()
-def run_episode_one_step(
-    policy: BesoPolicy,
-    dataset: LeRobotDataset,
-    episode_idx: int,
-    state7_mode: str,
-    metrics: RolloutMetricsAccumulator,
-    device: torch.device,
-    gt_shift: int,
-):
-    start, end = _episode_bounds(dataset, episode_idx)
-    window_size = policy.config.window_size
-
-    for t, abs_idx in enumerate(
-        tqdm(
-            range(start, end),
-            total=end - start,
-            desc=f"episode {episode_idx}",
-            unit="frame",
-            leave=False,
-        )
-    ):
-        hist_start = max(start, abs_idx - window_size + 1)
-
-        policy.reset()
-        state_adapter = BesoRolloutStateAdapter(mode=state7_mode, init_prev_gripper=INIT_PREV_GRIPPER)
-
-        pred_action = None
-        frame_at_abs_idx = None
-        for j in range(hist_start, abs_idx + 1):
-            frame = dataset[j]
-            if j == abs_idx:
-                frame_at_abs_idx = frame
-            policy_input = _build_policy_input_for_frame(
-                frame=frame,
-                policy=policy,
-                device=device,
-                state_adapter=state_adapter,
-            )
-            pred_action = policy.select_action(policy_input)
-            if pred_action.ndim == 2:
-                pred_action = pred_action[0]
-            pred_action = pred_action.to(device=device, dtype=torch.float32)
-            state_adapter.update_from_pred_action(pred_action)
-
-        gt_action = _get_shifted_gt_action(
-            dataset=dataset,
-            start=start,
-            end=end,
-            abs_idx=abs_idx,
-            gt_shift=gt_shift,
-            device=device,
-            frame_at_abs_idx=frame_at_abs_idx,
-        )
-        if gt_action is None:
-            continue
-        metrics.add_step(
-            diff=pred_action - gt_action,
-            t=t,
-            window_size=window_size,
-            pred_action=pred_action,
-            gt_action=gt_action,
-        )
-
-    metrics.add_episode()
-
-
-@torch.no_grad()
-def run_one_step_eval(
-    policy: BesoPolicy,
-    dataset: LeRobotDataset,
-    eval_episode_indices: list[int],
-    state7_mode: str,
-    device: torch.device,
-    gt_shift: int,
-) -> dict[str, float]:
-    policy.eval()
-    metrics = RolloutMetricsAccumulator(prefix="one_step")
-
-    for ep in tqdm(eval_episode_indices, desc="episodes(one_step)", unit="ep"):
-        log.info("One-step eval episode %d", ep)
-        run_episode_one_step(
-            policy=policy,
-            dataset=dataset,
-            episode_idx=ep,
-            state7_mode=state7_mode,
-            metrics=metrics,
-            device=device,
-            gt_shift=gt_shift,
-        )
-
-    return metrics.finalize()
-
-
-@torch.no_grad()
-def run_constant_baseline_eval(
-    dataset: LeRobotDataset,
-    eval_episode_indices: list[int],
-    baseline_action: torch.Tensor,
-    window_size: int,
-    device: torch.device,
-    gt_shift: int,
-) -> dict[str, float]:
-    metrics = RolloutMetricsAccumulator(prefix="baseline")
-    baseline_action = baseline_action.to(device=device, dtype=torch.float32)
-
-    for ep in tqdm(eval_episode_indices, desc="episodes(baseline)", unit="ep"):
-        start, end = _episode_bounds(dataset, ep)
-        for t, abs_idx in enumerate(
-            tqdm(
-                range(start, end),
-                total=end - start,
-                desc=f"episode {ep}",
-                unit="frame",
-                leave=False,
-            )
-        ):
-            frame = dataset[abs_idx]
-            gt_action = _get_shifted_gt_action(
-                dataset=dataset,
-                start=start,
-                end=end,
-                abs_idx=abs_idx,
-                gt_shift=gt_shift,
-                device=device,
-                frame_at_abs_idx=frame,
-            )
-            if gt_action is None:
-                continue
-            pred_action = baseline_action
-            metrics.add_step(
-                diff=pred_action - gt_action,
-                t=t,
-                window_size=window_size,
-                pred_action=pred_action,
-                gt_action=gt_action,
-            )
-        metrics.add_episode()
-
-    return metrics.finalize()
-
-
 def _load_policy(
     pretrained_dir: Path,
     dataset: LeRobotDataset,
     dataset_stats: dict,
     device: torch.device,
+    state_only: bool = False,
+    use_non_ema: bool = False,
 ) -> BesoPolicy:
-    policy = BesoPolicy.from_pretrained(
-        pretrained_dir,
-        dataset_meta=dataset.meta,
-        dataset_stats=dataset_stats,
+    cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
+    # Load BESO-specific fields that draccus doesn't serialize to config.json.
+    beso_cfg_file = pretrained_dir / BESO_CONFIG_NAME
+    if beso_cfg_file.exists():
+        with open(beso_cfg_file) as _f:
+            _extra = json.load(_f)
+        for _k, _v in _extra.items():
+            if _v is not None or not hasattr(cfg, _k):
+                setattr(cfg, _k, _v)
+        log.info("Loaded BESO extra config from %s: %s", BESO_CONFIG_NAME,
+                 {k: _extra[k] for k in ("sigma_data", "sigma_max", "sigma_min", "sampling_steps") if k in _extra})
+    else:
+        log.warning("No %s found in %s — BESO sigma/arch params will use BesoConfig defaults", BESO_CONFIG_NAME, pretrained_dir)
+    cfg.state_only = state_only
+    cfg.device = str(device)
+    _align_cfg_with_checkpoint_arch(cfg, pretrained_dir)
+    weight_file = (
+        pretrained_dir / "model_non_ema.safetensors"
+        if use_non_ema
+        else pretrained_dir / "model.safetensors"
     )
+    if not weight_file.exists():
+        raise FileNotFoundError(f"Weight file not found: {weight_file}")
+    # resize_shape fallback: infer from pos_grid in weights for old checkpoints without beso_config.json.
+    if not beso_cfg_file.exists():
+        with safe_open(str(weight_file), framework="pt") as _sf:
+            _pg = next((k for k in _sf.keys() if k.endswith(".pool.pos_grid")), None)
+            if _pg is not None:
+                _n = _sf.get_tensor(_pg).shape[0]
+                _side = round(_n ** 0.5)
+                cfg.resize_shape = (_side * 32, _side * 32) if _side * _side == _n else None
+            else:
+                cfg.resize_shape = None
+    log.info(
+        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_seq_len=%s goal_feature=%s state_only=%s weights=%s",
+        getattr(cfg, "n_obs_steps", None),
+        getattr(cfg, "window_size", None),
+        getattr(cfg, "goal_conditioned", None),
+        getattr(cfg, "goal_seq_len", None),
+        getattr(cfg, "goal_feature", None),
+        getattr(cfg, "state_only", None),
+        weight_file.name,
+    )
+    policy = BesoPolicy(config=cfg, dataset_meta=dataset.meta, dataset_stats=dataset_stats)
+    policy = BesoPolicy._load_as_safetensor(policy, str(weight_file), str(device), strict=False)
     policy = policy.to(device)
     policy.eval()
     return policy
@@ -575,6 +482,7 @@ def main():
     args = _parse_args()
     _setup_logging()
     set_seed_everywhere(args.seed)
+    actual_image_input = _parse_actual_image_input(args.actual_image_input)
 
     data_dir = Path(args.data_dir)
     if args.stats_data_dir is not None:
@@ -585,8 +493,6 @@ def main():
     device = torch.device(args.device)
     ckpts = _collect_pretrained_dirs(checkpoint_path, args.all_checkpoints)
     log.info("Evaluating %d checkpoint(s)", len(ckpts))
-    gt_shifts = [-1, 0, 1] if args.scan_gt_shift else [args.gt_shift]
-    log.info("eval_mode=%s state7_mode=%s gt_shifts=%s", args.eval_mode, args.state7_mode, gt_shifts)
     all_results: list[dict] = []
 
     dataset = LeRobotDataset(
@@ -602,11 +508,11 @@ def main():
         raise FileNotFoundError(f"stats.json not found: {stats_path}")
     with open(stats_path, "r", encoding="utf-8") as f:
         dataset_stats = json.load(f)
-    baseline_action = torch.as_tensor(dataset_stats["action"]["mean"], dtype=torch.float32, device=device)
     eval_episodes = list(range(int(dataset.meta.total_episodes)))
     log.info("Loaded eval dataset: %s", data_dir)
     log.info("Loaded normalization stats from: %s", stats_data_dir)
     log.info("eval episodes=%s", eval_episodes)
+    log.info("actual_image_input=%s", args.actual_image_input)
     print(f"[INFO] normalization stats source: {stats_data_dir}")
 
     wandb_run = None
@@ -625,17 +531,12 @@ def main():
                 "seed": args.seed,
                 "stats_data_dir": str(stats_data_dir),
                 "video_backend": VIDEO_BACKEND,
-                "init_prev_gripper": INIT_PREV_GRIPPER,
                 "eval_episodes": eval_episodes,
                 "all_checkpoints": args.all_checkpoints,
-                "eval_mode": args.eval_mode,
-                "state7_mode": args.state7_mode,
-                "gt_shift": args.gt_shift,
-                "scan_gt_shift": args.scan_gt_shift,
+                "actual_image_input": args.actual_image_input,
             },
         )
 
-    baseline_metrics_cache: dict[int, dict[str, float]] = {}
     for step, pretrained_dir in tqdm(ckpts, desc="checkpoints", unit="ckpt"):
         log.info("Loading policy from %s", pretrained_dir)
         policy = _load_policy(
@@ -643,66 +544,16 @@ def main():
             dataset=dataset,
             dataset_stats=dataset_stats,
             device=device,
+            state_only=args.state_only,
+            use_non_ema=args.use_non_ema,
         )
-        metrics: dict[str, float] = {}
-        metrics_by_shift: dict[str, dict[str, float]] = {}
-        for gt_shift in gt_shifts:
-            if gt_shift not in baseline_metrics_cache:
-                baseline_metrics_cache[gt_shift] = run_constant_baseline_eval(
-                    dataset=dataset,
-                    eval_episode_indices=eval_episodes,
-                    baseline_action=baseline_action,
-                    window_size=policy.config.window_size,
-                    device=device,
-                    gt_shift=gt_shift,
-                )
-
-            shift_metrics: dict[str, float] = {}
-            if args.eval_mode in {"rollout", "both"}:
-                shift_metrics.update(
-                    run_rollout_eval(
-                        policy=policy,
-                        dataset=dataset,
-                        eval_episode_indices=eval_episodes,
-                        state7_mode=args.state7_mode,
-                        device=device,
-                        gt_shift=gt_shift,
-                    )
-                )
-            shift_metrics.update(baseline_metrics_cache[gt_shift])
-            if args.eval_mode in {"one_step", "both"}:
-                shift_metrics.update(
-                    run_one_step_eval(
-                        policy=policy,
-                        dataset=dataset,
-                        eval_episode_indices=eval_episodes,
-                        state7_mode=args.state7_mode,
-                        device=device,
-                        gt_shift=gt_shift,
-                    )
-                )
-            metrics_by_shift[str(gt_shift)] = shift_metrics
-            if len(gt_shifts) == 1:
-                metrics = shift_metrics
-            else:
-                tag = _shift_tag(gt_shift)
-                for k, v in shift_metrics.items():
-                    metrics[f"shift_{tag}/{k}"] = v
-
-        if len(gt_shifts) > 1:
-            if args.eval_mode in {"rollout", "both"}:
-                score_key = "rollout/joint_mse"
-            else:
-                score_key = "one_step/joint_mse"
-            valid_pairs = []
-            for s in gt_shifts:
-                v = metrics_by_shift[str(s)].get(score_key, float("nan"))
-                if not np.isnan(v):
-                    valid_pairs.append((s, v))
-            if valid_pairs:
-                best_shift, best_score = min(valid_pairs, key=lambda x: x[1])
-                metrics["summary/best_gt_shift"] = float(best_shift)
-                metrics[f"summary/best_{score_key}"] = float(best_score)
+        metrics = run_rollout_eval(
+            policy=policy,
+            dataset=dataset,
+            eval_episode_indices=eval_episodes,
+            device=device,
+            actual_image_input=actual_image_input,
+        )
 
         log.info("Checkpoint %s metrics:", pretrained_dir)
         for k, v in metrics.items():
@@ -716,14 +567,10 @@ def main():
                 "pretrained_dir": str(pretrained_dir),
                 "data_dir": str(data_dir),
                 "stats_data_dir": str(stats_data_dir),
-                "eval_mode": args.eval_mode,
-                "state7_mode": args.state7_mode,
-                "gt_shift": args.gt_shift,
-                "scan_gt_shift": args.scan_gt_shift,
+                "actual_image_input": args.actual_image_input,
+                "use_non_ema": args.use_non_ema,
                 "metrics": metrics,
             }
-            if len(gt_shifts) > 1:
-                payload["metrics_by_shift"] = metrics_by_shift
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             print(f"[INFO] wrote metrics json: {out_path}")
@@ -731,10 +578,9 @@ def main():
             result_item = {
                 "checkpoint_step": step,
                 "pretrained_dir": str(pretrained_dir),
+                "use_non_ema": args.use_non_ema,
                 "metrics": metrics,
             }
-            if len(gt_shifts) > 1:
-                result_item["metrics_by_shift"] = metrics_by_shift
             all_results.append(result_item)
 
         if wandb_run is not None:
@@ -756,10 +602,8 @@ def main():
             "data_dir": str(data_dir),
             "stats_data_dir": str(stats_data_dir),
             "checkpoints_root": str(checkpoints_root),
-            "eval_mode": args.eval_mode,
-            "state7_mode": args.state7_mode,
-            "gt_shift": args.gt_shift,
-            "scan_gt_shift": args.scan_gt_shift,
+            "actual_image_input": args.actual_image_input,
+            "use_non_ema": args.use_non_ema,
             "results": all_results,
         }
         with open(out_path, "w", encoding="utf-8") as f:

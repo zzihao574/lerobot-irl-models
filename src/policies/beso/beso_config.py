@@ -1,5 +1,26 @@
+import json
+from pathlib import Path
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+# Fields that BesoConfig stores on self.xxx but that are NOT forwarded to
+# DiffusionConfig via kwargs, so draccus.dump() omits them from config.json.
+# We persist these in a sidecar file "beso_config.json" next to config.json.
+_BESO_EXTRA_FIELDS = [
+    "sigma_data", "sigma_max", "sigma_min", "sampling_steps", "sigma_sample_density_type",
+    "embed_dim", "n_layers", "n_heads",
+    "attn_pdrop", "resid_pdrop", "mlp_pdrop", "embed_pdrop",
+    "qk_norm", "norm_type", "mlp_type", "mlp_bias", "attention_impl",
+    "use_pos_emb", "linear_output", "window_size",
+    "freeze_rgb_encoder", "state_only",
+    "use_ema", "ema_decay", "ema_update_every_n_steps",
+    "goal_conditioned", "goal_feature", "goal_seq_len", "cond_mask_prob", "cond_lambda",
+    "use_language", "clip_model_name", "freeze_clip", "language_feature",
+    "rgb_encoder_lr", "resize_shape",
+]
+
+BESO_CONFIG_NAME = "beso_config.json"
 
 
 @PreTrainedConfig.register_subclass("beso")
@@ -19,7 +40,7 @@ class BesoConfig(DiffusionConfig):
         embed_dim: int = 360,
         n_layers: int = 6,
         n_heads: int = 6,
-        attn_pdrop: float = 0.3,
+        attn_pdrop: float = 0.1,
         resid_pdrop: float = 0.0,
         mlp_pdrop: float = 0.0,
         embed_pdrop: float = 0.0,
@@ -35,9 +56,11 @@ class BesoConfig(DiffusionConfig):
         pretrained_backbone_weights: str | None = "ResNet34_Weights.IMAGENET1K_V1",
         use_group_norm: bool = False,
         crop_shape: tuple[int, int] | None = (192, 192),
-        crop_is_random: bool = True,
+        crop_is_random: bool = False,
+        resize_shape: tuple[int, int] | None = None,
         use_separate_rgb_encoder_per_camera: bool = False,
         freeze_rgb_encoder: bool = False,
+        state_only: bool = False,
         spatial_softmax_num_keypoints: int = 32,
         # EMA
         use_ema: bool = True,
@@ -58,6 +81,8 @@ class BesoConfig(DiffusionConfig):
         down_dims: tuple[int, ...] = (128, 256),
         optimizer_betas: tuple = (0.9, 0.999),
         scheduler_warmup_steps: int = 100,
+        # Differential LR for RGB encoder (only used when freeze_rgb_encoder=False)
+        rgb_encoder_lr: float = 1e-5,
         **kwargs,
     ):
         kwargs["n_action_steps"] = n_action_steps
@@ -137,8 +162,10 @@ class BesoConfig(DiffusionConfig):
         self.use_group_norm = use_group_norm
         self.crop_shape = crop_shape
         self.crop_is_random = crop_is_random
+        self.resize_shape = resize_shape  # not forwarded to DiffusionConfig
         self.use_separate_rgb_encoder_per_camera = use_separate_rgb_encoder_per_camera
         self.freeze_rgb_encoder = freeze_rgb_encoder
+        self.state_only = state_only
         self.spatial_softmax_num_keypoints = spatial_softmax_num_keypoints
 
         # EMA
@@ -165,3 +192,11 @@ class BesoConfig(DiffusionConfig):
         self.down_dims = down_dims
         self.optimizer_betas = optimizer_betas
         self.scheduler_warmup_steps = scheduler_warmup_steps
+        self.rgb_encoder_lr = rgb_encoder_lr
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """Save base config via draccus, then write BESO-specific fields to beso_config.json."""
+        super()._save_pretrained(save_directory)
+        extra = {k: getattr(self, k) for k in _BESO_EXTRA_FIELDS if hasattr(self, k)}
+        with open(Path(save_directory) / BESO_CONFIG_NAME, "w") as f:
+            json.dump(extra, f, indent=4)

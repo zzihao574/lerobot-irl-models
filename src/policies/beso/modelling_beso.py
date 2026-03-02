@@ -79,7 +79,24 @@ class BesoPolicy(PreTrainedPolicy):
         self._ema_updates = 0
         self._ema_applied_for_eval = False
 
-    def get_optim_params(self) -> dict:
+    def get_optim_params(self):
+        """
+        Return optimizer parameter groups with differential LR.
+        """
+        if (
+            not self.config.freeze_rgb_encoder
+            and not self.config.state_only
+            and hasattr(self.diffusion, "rgb_encoder")
+        ):
+            enc_params = list(self.diffusion.rgb_encoder.parameters())
+            enc_ids = {id(p) for p in enc_params}
+            other_params = [
+                p for p in self.diffusion.parameters() if id(p) not in enc_ids
+            ]
+            return [
+                {"params": enc_params, "lr": self.config.rgb_encoder_lr},
+                {"params": other_params},
+            ]
         return self.diffusion.parameters()
 
     def _store_original_weights_and_apply_ema(self):
@@ -161,7 +178,7 @@ class BesoPolicy(PreTrainedPolicy):
         }
         self._action_context = deque(maxlen=window_size - 1)
 
-        if self.config.image_features:
+        if self.config.image_features and not self.config.state_only:
             self._queues["observation.images"] = deque(maxlen=window_size)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(
@@ -199,7 +216,7 @@ class BesoPolicy(PreTrainedPolicy):
         if ACTION in batch:
             batch.pop(ACTION)
         batch = self.normalize_inputs(batch)
-        if self.config.image_features:
+        if self.config.image_features and not self.config.state_only:
             batch = dict(
                 batch
             )  # shallow copy so that adding a key doesn't modify the original
@@ -221,7 +238,7 @@ class BesoPolicy(PreTrainedPolicy):
     # ========= training  ============
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
+        if self.config.image_features and not self.config.state_only:
             batch = dict(
                 batch
             )  # shallow copy so that adding a key doesn't modify the original
@@ -245,11 +262,12 @@ class BesoModel(nn.Module):
         self.sampling_steps = config.sampling_steps
         self.goal_conditioned = config.goal_conditioned
         self.goal_feature = config.goal_feature
+        self.goal_seq_len = config.goal_seq_len
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
         goal_dim = 0
 
-        if self.config.image_features:
+        if self.config.image_features and not self.config.state_only:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [BesoRgbEncoder(config) for _ in range(num_images)]
@@ -316,23 +334,6 @@ class BesoModel(nn.Module):
 
         print("BESO Model Parameter Count:")
         print("=" * 40)
-
-    def _freeze_rgb_encoder_if_needed(self):
-        if not self.config.freeze_rgb_encoder or not hasattr(self, "rgb_encoder"):
-            return
-        if isinstance(self.rgb_encoder, nn.ModuleList):
-            for encoder in self.rgb_encoder:
-                encoder.requires_grad_(False)
-                encoder.eval()
-        else:
-            self.rgb_encoder.requires_grad_(False)
-            self.rgb_encoder.eval()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self._freeze_rgb_encoder_if_needed()
-        return self
-
         if hasattr(self, "rgb_encoder"):
             if isinstance(self.rgb_encoder, nn.ModuleList):
                 total_encoder_params = sum(
@@ -356,6 +357,22 @@ class BesoModel(nn.Module):
         print(f"Total Parameters: {total_params:,}")
 
         print("=" * 40)
+
+    def _freeze_rgb_encoder_if_needed(self):
+        if not self.config.freeze_rgb_encoder or not hasattr(self, "rgb_encoder"):
+            return
+        if isinstance(self.rgb_encoder, nn.ModuleList):
+            for encoder in self.rgb_encoder:
+                encoder.requires_grad_(False)
+                encoder.eval()
+        else:
+            self.rgb_encoder.requires_grad_(False)
+            self.rgb_encoder.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._freeze_rgb_encoder_if_needed()
+        return self
 
     # ========= inference  ============
     def conditional_sample(
@@ -429,7 +446,7 @@ class BesoModel(nn.Module):
 
         # 2) images -> encoder -> concat cameras
         img_features = None
-        if self.config.image_features:
+        if self.config.image_features and not self.config.state_only:
             with torch.no_grad() if self.config.freeze_rgb_encoder else torch.enable_grad():
                 if self.config.use_separate_rgb_encoder_per_camera:
                     images_per_camera = einops.rearrange(
@@ -515,9 +532,16 @@ class BesoModel(nn.Module):
         if not self.goal_conditioned:
             return None
         goal = batch[self.goal_feature]
-        assert goal.ndim == 3
-        # goal_cond: [B, G, D_goal]
-        return goal
+        if goal.ndim == 4:
+            goal = goal[:, -1]  # [B, G, D]
+        elif goal.ndim == 2:
+            goal = goal.unsqueeze(1)  # [B, 1, D]
+        if goal.ndim != 3:
+            raise ValueError(
+                f"Unsupported goal tensor shape for {self.goal_feature}: {tuple(goal.shape)}"
+            )
+        goal = goal[:, -self.goal_seq_len :, :]
+        return goal.float()
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, S_cur = batch["observation.state"].shape[:2]
@@ -548,7 +572,8 @@ class BesoModel(nn.Module):
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
-        assert "observation.images" in batch or "observation.environment_state" in batch
+        if not self.config.state_only:
+            assert "observation.images" in batch or "observation.environment_state" in batch
         S_cur = batch["observation.state"].shape[1]
         assert S_cur == self.window_size, (
             f"Training expects fixed window_size={self.window_size}, got S_cur={S_cur}"
@@ -720,6 +745,8 @@ class BesoRgbEncoder(nn.Module):
                 self.maybe_random_crop = self.center_crop
         else:
             self.do_crop = False
+        # Optional resize (applied before crop, or alone when crop_shape=None)
+        self.resize_shape = getattr(config, "resize_shape", None)
 
         # Set up backbone.
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
@@ -743,9 +770,13 @@ class BesoRgbEncoder(nn.Module):
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = (
-            config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        )
+        _resize = getattr(config, "resize_shape", None)
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        elif _resize is not None:
+            dummy_shape_h_w = _resize
+        else:
+            dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
         self.pool = SpatialSoftmax(
@@ -762,11 +793,10 @@ class BesoRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # If we're going to crop, first up/downscale to 256x256 so the crop has enough context.
+        # Resize first (either to prepare for crop, or as sole preprocessing for full-image input).
+        if self.resize_shape is not None:
+            x = F.interpolate(x, size=self.resize_shape, mode="bilinear", align_corners=False)
         if self.do_crop:
-            # Bilinear resize on a batch tensor; preserves value range [0,1].
-            x = F.interpolate(x, size=(256, 256), mode="bilinear", align_corners=False)
-
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
             else:

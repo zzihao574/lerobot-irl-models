@@ -5,6 +5,7 @@ import pathlib
 _HF_DATASETS_CACHE = pathlib.Path(__file__).resolve().parents[1] / ".hf_datasets_cache"
 _HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ["HF_DATASETS_CACHE"] = str(_HF_DATASETS_CACHE)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -17,11 +18,32 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 from policies.beso.beso_config import BesoConfig
 
-def train(data_dir="data"):
+
+def _parse_episodes(spec: str | None) -> list[int] | None:
+    if spec is None or spec.strip() == "":
+        return None
+    episodes: list[int] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start = int(start_s)
+            end = int(end_s)
+            step = 1 if start <= end else -1
+            episodes.extend(range(start, end + step, step))
+        else:
+            episodes.append(int(token))
+    return sorted(set(episodes))
+
+
+def train(data_dir="data", state_only: bool = False, episodes: list[int] | None = None):
     print("\nStarting training...")
     dataset_cfg = DatasetConfig(
         repo_id=pathlib.Path(data_dir).name,
         root=data_dir,
+        episodes=episodes,
         video_backend="torchcodec",
     )
 
@@ -29,26 +51,36 @@ def train(data_dir="data"):
         # Experiment overrides on top of BesoConfig defaults.
         "window_size": 4,
         "goal_conditioned": False,
-        "goal_feature": "observation.goal.tail_q202",
+        "goal_feature": None,
         "goal_seq_len": 1,
         "use_amp": True,
-        "freeze_rgb_encoder": True,
+        "freeze_rgb_encoder": False,
+        "state_only": state_only,
         "drop_n_last_frames": 0,
+        # resize → random crop data augmentation
+        "crop_shape": (384, 384),
+        "crop_is_random": True,
+        "resize_shape": (420, 420),
+        # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
+        "sigma_data": 1.0,
+        "sigma_max": 10.0,
+        "sampling_steps": 5,
         "normalization_mapping": {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MEAN_STD,
         },
     }
     pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
     print(f"[INFO] normalization_mapping={pretrained_config.normalization_mapping}")
+    print(f"[INFO] state_only={state_only} episodes={episodes}")
     cfg = TrainPipelineConfig(
         policy=pretrained_config,
         dataset=dataset_cfg,
         batch_size=16,
-        num_workers=8,
-        steps=40000,
-        save_freq=4000,
+        num_workers=4,
+        steps=24000,
+        save_freq=2000,
         log_freq=20,
         wandb=get_wandb_config(),
     )
@@ -86,8 +118,23 @@ def main():
     parser.add_argument(
         "--data_dir", type=str, required=True, help="Path to the dataset directory"
     )
+    parser.add_argument(
+        "--state-only",
+        action="store_true",
+        help="Use only observation.state and ignore image features.",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=str,
+        default=None,
+        help="Subset episodes for training, e.g. '0,1' or '0-3,7'.",
+    )
     args = parser.parse_args()
-    train(data_dir=pathlib.Path(args.data_dir))
+    train(
+        data_dir=pathlib.Path(args.data_dir),
+        state_only=args.state_only,
+        episodes=_parse_episodes(args.episodes),
+    )
 
 
 if __name__ == "__main__":
