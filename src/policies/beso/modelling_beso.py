@@ -85,7 +85,6 @@ class BesoPolicy(PreTrainedPolicy):
         """
         if (
             not self.config.freeze_rgb_encoder
-            and not self.config.state_only
             and hasattr(self.diffusion, "rgb_encoder")
         ):
             enc_params = list(self.diffusion.rgb_encoder.parameters())
@@ -178,7 +177,7 @@ class BesoPolicy(PreTrainedPolicy):
         }
         self._action_context = deque(maxlen=window_size - 1)
 
-        if self.config.image_features and not self.config.state_only:
+        if self.config.image_features:
             self._queues["observation.images"] = deque(maxlen=window_size)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(
@@ -211,15 +210,17 @@ class BesoPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        # in select_action(...)
-
         if ACTION in batch:
             batch.pop(ACTION)
-        batch = self.normalize_inputs(batch)
-        if self.config.image_features and not self.config.state_only:
-            batch = dict(
-                batch
-            )  # shallow copy so that adding a key doesn't modify the original
+        batch = dict(batch)  # shallow copy
+        for key, feature in self.normalize_inputs.features.items():
+            if key in batch:
+                batch[key] = self.normalize_inputs._apply_transform(
+                    batch[key], key, feature.type, inverse=False,
+                )
+
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
@@ -238,10 +239,8 @@ class BesoPolicy(PreTrainedPolicy):
     # ========= training  ============
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features and not self.config.state_only:
-            batch = dict(
-                batch
-            )  # shallow copy so that adding a key doesn't modify the original
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
@@ -267,7 +266,7 @@ class BesoModel(nn.Module):
         global_cond_dim = self.config.robot_state_feature.shape[0]
         goal_dim = 0
 
-        if self.config.image_features and not self.config.state_only:
+        if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [BesoRgbEncoder(config) for _ in range(num_images)]
@@ -398,15 +397,22 @@ class BesoModel(nn.Module):
             
         action_dim = self.config.action_feature.shape[0]
         if action_context is None:
-            actions = (
+            # Cold-start: no history available.
+            history_fill = torch.zeros(
+                size=(batch_size, T_cur - 1, action_dim),
+                dtype=dtype,
+                device=device,
+            )
+            noise_last = (
                 torch.randn(
-                    size=(batch_size, T_cur, action_dim),
+                    size=(batch_size, 1, action_dim),
                     dtype=dtype,
                     device=device,
                     generator=generator,
                 )
                 * self.sigma_max
             )
+            actions = torch.cat([history_fill, noise_last], dim=1)
         else:
             action_context = action_context.to(device=device, dtype=dtype)
             noise_last = (
@@ -446,7 +452,7 @@ class BesoModel(nn.Module):
 
         # 2) images -> encoder -> concat cameras
         img_features = None
-        if self.config.image_features and not self.config.state_only:
+        if self.config.image_features:
             with torch.no_grad() if self.config.freeze_rgb_encoder else torch.enable_grad():
                 if self.config.use_separate_rgb_encoder_per_camera:
                     images_per_camera = einops.rearrange(
@@ -572,8 +578,7 @@ class BesoModel(nn.Module):
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
-        if not self.config.state_only:
-            assert "observation.images" in batch or "observation.environment_state" in batch
+        assert "observation.images" in batch or "observation.environment_state" in batch
         S_cur = batch["observation.state"].shape[1]
         assert S_cur == self.window_size, (
             f"Training expects fixed window_size={self.window_size}, got S_cur={S_cur}"
@@ -603,16 +608,11 @@ class BesoModel(nn.Module):
             append_dims(x, trajectory.ndim) for x in self.get_scalings(sigmas)
         ]
         # c_skip, c_out, c_in: [B, 1, 1] (broadcast to [B, T, A])
-
-        # Only noise the LAST timestep to match eval behaviour:
         # eval feeds [clean_t1, ..., clean_{T-1}, noisy_tT] to the model.
         noise_mask = torch.zeros_like(trajectory)
         noise_mask[:, -1:, :] = 1.0  # [B, T, A] — only last step is noised
         noised_input = trajectory + noise * append_dims(sigmas, trajectory.ndim) * noise_mask
         # noised_input: [B, T, A]  (first T-1 steps are clean, last step is noised)
-
-        # c_in(sigma=10) ≈ 0.1. Scaling clean history by this crushes its amplitude to ~10%,
-        # making the transformer unable to read past context → collapses to mean prediction.
         # For clean steps sigma=0, so c_in(0) = 1/sigma_data = 1.0 (when sigma_data=1).
         c_in_history = 1.0 / (self.sigma_data ** 2) ** 0.5  # =1.0 when sigma_data=1
         scaled_input = torch.cat([
@@ -633,11 +633,6 @@ class BesoModel(nn.Module):
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
-                raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
-                )
             in_episode_bound = ~batch["action_is_pad"]
             # action_is_pad: [B, T] — use last timestep's pad flag
             loss = loss * in_episode_bound[:, -1:].unsqueeze(-1)

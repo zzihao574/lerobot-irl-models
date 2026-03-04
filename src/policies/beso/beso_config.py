@@ -13,7 +13,7 @@ _BESO_EXTRA_FIELDS = [
     "attn_pdrop", "resid_pdrop", "mlp_pdrop", "embed_pdrop",
     "qk_norm", "norm_type", "mlp_type", "mlp_bias", "attention_impl",
     "use_pos_emb", "linear_output", "window_size",
-    "freeze_rgb_encoder", "state_only",
+    "freeze_rgb_encoder",
     "use_ema", "ema_decay", "ema_update_every_n_steps",
     "goal_conditioned", "goal_feature", "goal_seq_len", "cond_mask_prob", "cond_lambda",
     "use_language", "clip_model_name", "freeze_clip", "language_feature",
@@ -40,9 +40,9 @@ class BesoConfig(DiffusionConfig):
         embed_dim: int = 360,
         n_layers: int = 6,
         n_heads: int = 6,
-        attn_pdrop: float = 0.1,
-        resid_pdrop: float = 0.0,
-        mlp_pdrop: float = 0.0,
+        attn_pdrop: float = 0.2,
+        resid_pdrop: float = 0.1,
+        mlp_pdrop: float = 0.1,
         embed_pdrop: float = 0.0,
         qk_norm: bool = False,
         norm_type: str = "layernorm", # rmsnorm or layernorm
@@ -52,15 +52,14 @@ class BesoConfig(DiffusionConfig):
         use_pos_emb: bool = True,
         linear_output: bool = True,
         # RGB encoder parameters (used directly by BesoRgbEncoder)
-        vision_backbone: str = "resnet34",
-        pretrained_backbone_weights: str | None = "ResNet34_Weights.IMAGENET1K_V1",
+        vision_backbone: str = "resnet18",
+        pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1",
         use_group_norm: bool = False,
         crop_shape: tuple[int, int] | None = (192, 192),
         crop_is_random: bool = False,
         resize_shape: tuple[int, int] | None = None,
         use_separate_rgb_encoder_per_camera: bool = False,
         freeze_rgb_encoder: bool = False,
-        state_only: bool = False,
         spatial_softmax_num_keypoints: int = 32,
         # EMA
         use_ema: bool = True,
@@ -80,7 +79,7 @@ class BesoConfig(DiffusionConfig):
         # LeRobot compatibility knobs (inherited DiffusionConfig fields still used by presets/validation)
         down_dims: tuple[int, ...] = (128, 256),
         optimizer_betas: tuple = (0.9, 0.999),
-        scheduler_warmup_steps: int = 100,
+        scheduler_warmup_steps: int = 500,
         # Differential LR for RGB encoder (only used when freeze_rgb_encoder=False)
         rgb_encoder_lr: float = 1e-5,
         **kwargs,
@@ -165,7 +164,6 @@ class BesoConfig(DiffusionConfig):
         self.resize_shape = resize_shape  # not forwarded to DiffusionConfig
         self.use_separate_rgb_encoder_per_camera = use_separate_rgb_encoder_per_camera
         self.freeze_rgb_encoder = freeze_rgb_encoder
-        self.state_only = state_only
         self.spatial_softmax_num_keypoints = spatial_softmax_num_keypoints
 
         # EMA

@@ -66,16 +66,11 @@ def _parse_args():
         help="Load model_non_ema.safetensors instead of model.safetensors.",
     )
     ap.add_argument(
-        "--state-only",
-        action="store_true",
-        help="Force loading checkpoint as state-only policy.",
-    )
-    ap.add_argument(
-        "--actual-image-input",
-        type=str,
-        default="True",
-        choices=["True", "None"],
-        help="True: use original image input. None: replace visual inputs with zeros.",
+        "--sampling-steps",
+        type=int,
+        default=None,
+        help="Override DDIM sampling steps at eval time (independent of training config). "
+             "E.g. --sampling-steps 10 for higher quality inference.",
     )
     return ap.parse_args()
 
@@ -122,14 +117,6 @@ def _collect_pretrained_dirs(checkpoint_path: Path, all_checkpoints: bool) -> li
     if not out:
         raise FileNotFoundError(f"No valid checkpoint/pretrained_model dirs found under {checkpoints_root}")
     return out
-
-
-def _parse_actual_image_input(value: str) -> bool | None:
-    if value == "True":
-        return True
-    if value == "None":
-        return None
-    raise ValueError(f"Unsupported actual_image_input value: {value!r}")
 
 
 def _infer_pos_emb_seq_len_from_checkpoint(pretrained_dir: Path) -> int | None:
@@ -187,16 +174,6 @@ def _align_cfg_with_checkpoint_arch(cfg, pretrained_dir: Path) -> None:
         goal_seq_len,
         getattr(cfg, "goal_feature", None),
     )
-
-
-def _is_visual_feature(feature_def) -> bool:
-    if isinstance(feature_def, dict):
-        t = feature_def.get("type")
-    else:
-        t = getattr(feature_def, "type", None)
-    if t is None:
-        return False
-    return str(getattr(t, "value", t)).upper() == "VISUAL"
 
 
 @dataclass
@@ -333,17 +310,8 @@ def _build_policy_input_for_frame(
     frame: dict,
     policy: BesoPolicy,
     device: torch.device,
-    actual_image_input: bool | None,
 ) -> dict[str, torch.Tensor]:
-    batch = {}
-    for key in policy.config.input_features.keys():
-        if key == "observation.state":
-            batch[key] = frame["observation.state"].unsqueeze(0).to(device)
-        elif _is_visual_feature(policy.config.input_features[key]) and actual_image_input is None:
-            batch[key] = torch.zeros_like(frame[key]).unsqueeze(0).to(device)
-        else:
-            batch[key] = frame[key].unsqueeze(0).to(device)
-    return batch
+    return {key: frame[key].unsqueeze(0).to(device) for key in policy.config.input_features.keys()}
 
 
 @torch.no_grad()
@@ -353,7 +321,6 @@ def run_episode_rollout(
     episode_idx: int,
     metrics: RolloutMetricsAccumulator,
     device: torch.device,
-    actual_image_input: bool | None,
 ):
     start, end = _episode_bounds(dataset, episode_idx)
 
@@ -375,7 +342,6 @@ def run_episode_rollout(
             frame=frame,
             policy=policy,
             device=device,
-            actual_image_input=actual_image_input,
         )
 
         pred_action = policy.select_action(policy_input)
@@ -400,7 +366,6 @@ def run_rollout_eval(
     dataset: LeRobotDataset,
     eval_episode_indices: list[int],
     device: torch.device,
-    actual_image_input: bool | None,
 ) -> dict[str, float]:
     policy.eval()
     metrics = RolloutMetricsAccumulator(prefix="rollout")
@@ -413,7 +378,6 @@ def run_rollout_eval(
             episode_idx=ep,
             metrics=metrics,
             device=device,
-            actual_image_input=actual_image_input,
         )
 
     return metrics.finalize()
@@ -425,7 +389,6 @@ def _load_policy(
     dataset: LeRobotDataset,
     dataset_stats: dict,
     device: torch.device,
-    state_only: bool = False,
     use_non_ema: bool = False,
 ) -> BesoPolicy:
     cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
@@ -441,7 +404,6 @@ def _load_policy(
                  {k: _extra[k] for k in ("sigma_data", "sigma_max", "sigma_min", "sampling_steps") if k in _extra})
     else:
         log.warning("No %s found in %s — BESO sigma/arch params will use BesoConfig defaults", BESO_CONFIG_NAME, pretrained_dir)
-    cfg.state_only = state_only
     cfg.device = str(device)
     _align_cfg_with_checkpoint_arch(cfg, pretrained_dir)
     weight_file = (
@@ -462,13 +424,12 @@ def _load_policy(
             else:
                 cfg.resize_shape = None
     log.info(
-        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_seq_len=%s goal_feature=%s state_only=%s weights=%s",
+        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_seq_len=%s goal_feature=%s weights=%s",
         getattr(cfg, "n_obs_steps", None),
         getattr(cfg, "window_size", None),
         getattr(cfg, "goal_conditioned", None),
         getattr(cfg, "goal_seq_len", None),
         getattr(cfg, "goal_feature", None),
-        getattr(cfg, "state_only", None),
         weight_file.name,
     )
     policy = BesoPolicy(config=cfg, dataset_meta=dataset.meta, dataset_stats=dataset_stats)
@@ -478,11 +439,16 @@ def _load_policy(
     return policy
 
 
+def _override_sampling_steps(policy: "BesoPolicy", sampling_steps: int) -> None:
+    """Override DDIM sampling steps after model load (eval-time only)."""
+    policy.config.sampling_steps = sampling_steps
+    log.info("[override] sampling_steps → %d", sampling_steps)
+
+
 def main():
     args = _parse_args()
     _setup_logging()
     set_seed_everywhere(args.seed)
-    actual_image_input = _parse_actual_image_input(args.actual_image_input)
 
     data_dir = Path(args.data_dir)
     if args.stats_data_dir is not None:
@@ -512,7 +478,6 @@ def main():
     log.info("Loaded eval dataset: %s", data_dir)
     log.info("Loaded normalization stats from: %s", stats_data_dir)
     log.info("eval episodes=%s", eval_episodes)
-    log.info("actual_image_input=%s", args.actual_image_input)
     print(f"[INFO] normalization stats source: {stats_data_dir}")
 
     wandb_run = None
@@ -533,7 +498,6 @@ def main():
                 "video_backend": VIDEO_BACKEND,
                 "eval_episodes": eval_episodes,
                 "all_checkpoints": args.all_checkpoints,
-                "actual_image_input": args.actual_image_input,
             },
         )
 
@@ -544,15 +508,15 @@ def main():
             dataset=dataset,
             dataset_stats=dataset_stats,
             device=device,
-            state_only=args.state_only,
             use_non_ema=args.use_non_ema,
         )
+        if args.sampling_steps is not None:
+            _override_sampling_steps(policy, args.sampling_steps)
         metrics = run_rollout_eval(
             policy=policy,
             dataset=dataset,
             eval_episode_indices=eval_episodes,
             device=device,
-            actual_image_input=actual_image_input,
         )
 
         log.info("Checkpoint %s metrics:", pretrained_dir)
@@ -567,7 +531,6 @@ def main():
                 "pretrained_dir": str(pretrained_dir),
                 "data_dir": str(data_dir),
                 "stats_data_dir": str(stats_data_dir),
-                "actual_image_input": args.actual_image_input,
                 "use_non_ema": args.use_non_ema,
                 "metrics": metrics,
             }
@@ -602,7 +565,6 @@ def main():
             "data_dir": str(data_dir),
             "stats_data_dir": str(stats_data_dir),
             "checkpoints_root": str(checkpoints_root),
-            "actual_image_input": args.actual_image_input,
             "use_non_ema": args.use_non_ema,
             "results": all_results,
         }

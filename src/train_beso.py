@@ -38,7 +38,7 @@ def _parse_episodes(spec: str | None) -> list[int] | None:
     return sorted(set(episodes))
 
 
-def train(data_dir="data", state_only: bool = False, episodes: list[int] | None = None):
+def train(data_dir="data", episodes: list[int] | None = None):
     print("\nStarting training...")
     dataset_cfg = DatasetConfig(
         repo_id=pathlib.Path(data_dir).name,
@@ -55,7 +55,6 @@ def train(data_dir="data", state_only: bool = False, episodes: list[int] | None 
         "goal_seq_len": 1,
         "use_amp": True,
         "freeze_rgb_encoder": False,
-        "state_only": state_only,
         "drop_n_last_frames": 0,
         # resize → random crop data augmentation
         "crop_shape": (384, 384),
@@ -63,8 +62,9 @@ def train(data_dir="data", state_only: bool = False, episodes: list[int] | None 
         "resize_shape": (420, 420),
         # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
         "sigma_data": 1.0,
-        "sigma_max": 10.0,
-        "sampling_steps": 5,
+        "sigma_max": 4.0,
+        "do_mask_loss_for_padding": True,
+
         "normalization_mapping": {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MEAN_STD,
@@ -73,13 +73,13 @@ def train(data_dir="data", state_only: bool = False, episodes: list[int] | None 
     }
     pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
     print(f"[INFO] normalization_mapping={pretrained_config.normalization_mapping}")
-    print(f"[INFO] state_only={state_only} episodes={episodes}")
+    print(f"[INFO] episodes={episodes}")
     cfg = TrainPipelineConfig(
         policy=pretrained_config,
         dataset=dataset_cfg,
-        batch_size=16,
+        batch_size=24,
         num_workers=4,
-        steps=24000,
+        steps=30000,
         save_freq=2000,
         log_freq=20,
         wandb=get_wandb_config(),
@@ -119,11 +119,6 @@ def main():
         "--data_dir", type=str, required=True, help="Path to the dataset directory"
     )
     parser.add_argument(
-        "--state-only",
-        action="store_true",
-        help="Use only observation.state and ignore image features.",
-    )
-    parser.add_argument(
         "--episodes",
         type=str,
         default=None,
@@ -132,7 +127,6 @@ def main():
     args = parser.parse_args()
     train(
         data_dir=pathlib.Path(args.data_dir),
-        state_only=args.state_only,
         episodes=_parse_episodes(args.episodes),
     )
 

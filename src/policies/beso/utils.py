@@ -134,8 +134,6 @@ def sample_ddim(
     def t_fn(sigma):
         return sigma.log().neg()
 
-    # print("sigmas:", sigmas)
-
     for i in range(len(sigmas) - 1):
         # predict the next action
         if isinstance(state, tuple):
@@ -156,6 +154,5 @@ def sample_ddim(
             )
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
         h = t_next - t
-        # print("h",h,"Change h",(-h).expm1())
         action = (sigma_fn(t_next) / sigma_fn(t)) * action - (-h).expm1() * denoised
     return action
