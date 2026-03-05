@@ -261,7 +261,7 @@ class BesoModel(nn.Module):
         self.sampling_steps = config.sampling_steps
         self.goal_conditioned = config.goal_conditioned
         self.goal_feature = config.goal_feature
-        self.goal_seq_len = config.goal_seq_len
+        self.goal_seq_len = 0
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
         goal_dim = 0
@@ -282,9 +282,17 @@ class BesoModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
 
         if self.goal_conditioned:
-            # Goal is represented as [B, G, D_goal] at runtime; use the last feature dim as D_goal.
-            goal_shape = self.config.input_features[self.goal_feature].shape
-            goal_dim = goal_shape[-1]
+            goal_shape = tuple(self.config.input_features[self.goal_feature].shape)
+            if len(goal_shape) == 1:
+                self.goal_seq_len = 1
+                goal_dim = int(goal_shape[0])
+            elif len(goal_shape) == 2:
+                self.goal_seq_len = int(goal_shape[0])
+                goal_dim = int(goal_shape[1])
+            else:
+                raise ValueError(
+                    f"Unsupported goal feature shape for {self.goal_feature}: {goal_shape}."
+                )
 
         # Initialize CLIP text encoder for language instructions
         if self.config.use_language:
@@ -310,7 +318,7 @@ class BesoModel(nn.Module):
             cond_mask_prob=self.config.cond_mask_prob,
             embed_dim=config.embed_dim,
             embed_pdrob=config.embed_pdrop,
-            goal_seq_len=self.config.goal_seq_len,
+            goal_seq_len=self.goal_seq_len,
             window_size=self.window_size,
             linear_output=self.config.linear_output,
             use_pos_emb=self.config.use_pos_emb,
@@ -546,7 +554,10 @@ class BesoModel(nn.Module):
             raise ValueError(
                 f"Unsupported goal tensor shape for {self.goal_feature}: {tuple(goal.shape)}"
             )
-        goal = goal[:, -self.goal_seq_len :, :]
+        if goal.shape[1] != self.goal_seq_len:
+            raise ValueError(
+                f"Goal sequence length mismatch: expected {self.goal_seq_len}, got {goal.shape[1]}."
+            )
         return goal.float()
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
@@ -588,6 +599,8 @@ class BesoModel(nn.Module):
 
         # Forward diffusion.
         trajectory = batch["action"]  # [B, T, A]
+        # Align train-time boundary behavior with eval cold-start: use zero-filled padded history.
+        trajectory = trajectory.masked_fill(batch["action_is_pad"].unsqueeze(-1), 0.0)
 
         # Sample noise to add to the trajectory.
         noise = torch.randn(trajectory.shape, device=trajectory.device)  # [B, T, A]

@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Build a clean LeRobot dataset for BESO training:
+Build a clean LeRobot dataset for BESO training (new dataset version):
 1) Merge sub-datasets in a fixed order (reindex episode_index/index/task_index correctly)
 2) Split merged raw dataset into train/eval subsets
 3) For each split, add standard keys:
-   - observation.state = concat(q202, prev_gripper_action202)
-   - action = concat(action_q202, action_gripper202)
+   - observation.state = concat(q202, gripper_width_202)   [8D]
+   - action = concat(action_q202, action_gripper202)       [8D]
    - observation.goal.tail_q202 = per-episode fixed tail goal, repeated on every frame (shape [1, D_goal])
 4) Remove old split keys (do not keep legacy keys)
 
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import shutil
 import sys
@@ -41,19 +40,19 @@ def _parse_args():
     ap.add_argument(
         "--datasets-root",
         type=str,
-        default="/home/zzh/workspace/Robot_learning/datasets_robot",
+        default="/home/zzh/workspace/Robot_learning/dataset_new_2",
         help="Root containing sub-datasets (place_1..place_8, freestyle folders).",
     )
     ap.add_argument(
         "--merged-tmp-root",
         type=str,
-        default="/home/zzh/workspace/Robot_learning/datasets_robot/_tmp_beso_merged_raw",
+        default="/home/zzh/workspace/Robot_learning/dataset_new_2/_tmp_beso_merged_raw",
         help="Temporary merged dataset root (will be created).",
     )
     ap.add_argument(
         "--output-root",
         type=str,
-        default="/home/zzh/workspace/Robot_learning/datasets_robot/banana_beso_clean_v1",
+        default="/home/zzh/workspace/Robot_learning/dataset_new_2/banana_beso_clean_v1",
         help="Only used for its parent directory, where banana_beso_train/eval are written.",
     )
     ap.add_argument(
@@ -63,17 +62,10 @@ def _parse_args():
         help="Repo id label stored in LeRobot metadata.",
     )
     ap.add_argument(
-        "--tail-ratio",
-        type=float,
-        default=0.9,
-        help="Use the last (1-tail_ratio) portion of each episode to compute goal.",
-    )
-    ap.add_argument(
-        "--goal-reduce",
-        type=str,
-        default="median",
-        choices=["last", "mean", "median"],
-        help="How to reduce tail states into a single goal vector.",
+        "--goal-tail-frames",
+        type=int,
+        default=10,
+        help="Number of final q202 frames used to build goal; flattened to shape [1, goal_tail_frames*7].",
     )
     ap.add_argument(
         "--goal-key",
@@ -98,8 +90,7 @@ def _parse_args():
 def _canonical_source_order(root: Path) -> list[Path]:
     # Fixed order to avoid episode_index ambiguity and to make aggregation deterministic.
     alias_groups = [[f"place_{i}"] for i in range(1, 9)] + [
-        ["0-9_freestyle", "0-9 freestyle", "0-9_ freestyle"],
-        ["10-13_freestyle", "10-13 freestyle", "10-13_ freestyle"],
+        ["0-10_freestyle", "0-10 freestyle", "0-10_ freestyle"],
     ]
     paths: list[Path] = []
     missing_groups: list[list[str]] = []
@@ -122,46 +113,44 @@ def _canonical_source_order(root: Path) -> list[Path]:
     return paths
 
 
-def _tail_reduce(arr: np.ndarray, tail_ratio: float, reduce: str) -> np.ndarray:
+def _tail_flatten(arr: np.ndarray, tail_frames: int) -> np.ndarray:
     # arr: [L, D]
     if arr.ndim != 2:
         raise ValueError(f"Expected [L, D], got {arr.shape}")
-    L = arr.shape[0]
+    if tail_frames <= 0:
+        raise ValueError(f"tail_frames must be > 0, got {tail_frames}")
+
+    L, D = arr.shape
     if L == 0:
         raise ValueError("Empty episode array")
 
-    start = int(math.floor(L * tail_ratio))
-    start = min(max(start, 0), L - 1)
-    tail = arr[start:]  # [L_tail, D]
-
-    if reduce == "last":
-        out = tail[-1]
-    elif reduce == "mean":
-        out = tail.mean(axis=0)
-    elif reduce == "median":
-        out = np.median(tail, axis=0)
+    if L >= tail_frames:
+        tail = arr[-tail_frames:]  # [tail_frames, D]
     else:
-        raise ValueError(f"Unknown reduce={reduce}")
+        # Left pad with the first frame to keep a fixed-length goal when episodes are short.
+        pad = np.repeat(arr[:1], tail_frames - L, axis=0)
+        tail = np.concatenate([pad, arr], axis=0)
 
-    return out.astype(np.float32)
+    return tail.reshape(tail_frames * D).astype(np.float32)
 
 
-def _build_episode_tables(merged_dataset, tail_ratio: float, goal_reduce: str):
+def _build_episode_tables(merged_dataset, goal_tail_frames: int):
     """
     Precompute per-episode sequences after aggregation (episode_index already globally reindexed).
 
     Returns:
       episode_to_action: dict[int, np.ndarray]  # [L, 8]
       episode_to_state:  dict[int, np.ndarray]  # [L, 8]
-      episode_to_goal:   dict[int, np.ndarray]  # [7]
+      episode_to_goal:   dict[int, np.ndarray]  # [goal_tail_frames * 7]
     """
     hf = merged_dataset.hf_dataset.with_format(None)
 
-    q202 = np.asarray(hf["observation.state.q.Panda202"], dtype=np.float32)          # [N, 7]
-    aq202 = np.asarray(hf["action.q.Panda202"], dtype=np.float32)                     # [N, 7]
-    g202 = np.asarray(hf["action.gripper_width.PandaGripper202"], dtype=np.float32)   # [N] or [N,1]
-    ep_idx = np.asarray(hf["episode_index"], dtype=np.int64)                          # [N]
-    frame_idx = np.asarray(hf["frame_index"], dtype=np.int64)                         # [N]
+    q202 = np.asarray(hf["observation.state.q.Panda202"], dtype=np.float32)                    # [N, 7]
+    aq202 = np.asarray(hf["action.q.Panda202"], dtype=np.float32)                               # [N, 7]
+    g202 = np.asarray(hf["action.gripper_width.PandaGripper202"], dtype=np.float32)             # [N] or [N,1]
+    obs_g202 = np.asarray(hf["observation.state.gripper_width.PandaGripper202"], dtype=np.float32)  # [N] or [N,1]
+    ep_idx = np.asarray(hf["episode_index"], dtype=np.int64)                                    # [N]
+    frame_idx = np.asarray(hf["frame_index"], dtype=np.int64)                                   # [N]
 
     if g202.ndim == 1:
         g202 = g202[:, None]  # [N, 1]
@@ -170,16 +159,23 @@ def _build_episode_tables(merged_dataset, tail_ratio: float, goal_reduce: str):
     else:
         raise ValueError(f"Unexpected gripper action shape: {g202.shape}")
 
+    if obs_g202.ndim == 1:
+        obs_g202 = obs_g202[:, None]  # [N, 1]
+    elif obs_g202.ndim == 2 and obs_g202.shape[1] == 1:
+        pass
+    else:
+        raise ValueError(f"Unexpected obs gripper shape: {obs_g202.shape}")
+
     N = len(ep_idx)
-    if not (len(q202) == len(aq202) == len(g202) == len(frame_idx) == N):
+    if not (len(q202) == len(aq202) == len(g202) == len(obs_g202) == len(frame_idx) == N):
         raise ValueError("Column lengths mismatch in merged dataset")
 
     # Collect rows by episode in global order (after merge, episode_index is already unique/reindexed)
-    rows_by_ep: dict[int, list[tuple[int, np.ndarray, np.ndarray, np.ndarray]]] = {}
+    rows_by_ep: dict[int, list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = {}
     for i in range(N):
         e = int(ep_idx[i])
         f = int(frame_idx[i])
-        rows_by_ep.setdefault(e, []).append((f, q202[i], aq202[i], g202[i]))
+        rows_by_ep.setdefault(e, []).append((f, q202[i], aq202[i], g202[i], obs_g202[i]))
 
     unique_eps = sorted(rows_by_ep.keys())
     # Expect contiguous after official aggregation
@@ -204,24 +200,19 @@ def _build_episode_tables(merged_dataset, tail_ratio: float, goal_reduce: str):
                 f"Expected head={expected_frames[:10]}, got head={got_frames[:10]}"
             )
 
-        q_seq = np.stack([r[1] for r in rows], axis=0).astype(np.float32)     # [L, 7]
-        aq_seq = np.stack([r[2] for r in rows], axis=0).astype(np.float32)    # [L, 7]
-        g_seq = np.stack([r[3] for r in rows], axis=0).astype(np.float32)     # [L, 1]
+        q_seq = np.stack([r[1] for r in rows], axis=0).astype(np.float32)         # [L, 7]
+        aq_seq = np.stack([r[2] for r in rows], axis=0).astype(np.float32)        # [L, 7]
+        g_seq = np.stack([r[3] for r in rows], axis=0).astype(np.float32)         # [L, 1]
+        obs_g202_seq = np.stack([r[4] for r in rows], axis=0).astype(np.float32)  # [L, 1]
 
         # action = [action.q.Panda202, action.gripper_width.PandaGripper202]
         action_seq = np.concatenate([aq_seq, g_seq], axis=1)  # [L, 8]
 
-        # prev gripper action as state feature (boundary: t=0 uses current action)
-        prev_g = np.empty_like(g_seq)  # [L, 1]
-        prev_g[0] = g_seq[0]
-        if len(g_seq) > 1:
-            prev_g[1:] = g_seq[:-1]
+        # observation.state = [observation.state.q.Panda202, observation.state.gripper_width.PandaGripper202]
+        state_seq = np.concatenate([q_seq, obs_g202_seq], axis=1)  # [L, 8]
 
-        # observation.state = [observation.state.q.Panda202, prev_gripper_action202]
-        state_seq = np.concatenate([q_seq, prev_g], axis=1)  # [L, 8]
-
-        # goal = tail statistic of q202 only (shape [7])
-        goal_vec = _tail_reduce(q_seq, tail_ratio=tail_ratio, reduce=goal_reduce)  # [7]
+        # goal = flatten(last goal_tail_frames of q202), shape [goal_tail_frames * 7]
+        goal_vec = _tail_flatten(q_seq, tail_frames=goal_tail_frames)
 
         episode_to_action[e] = action_seq
         episode_to_state[e] = state_seq
@@ -257,16 +248,23 @@ def _patch_visual_feature_names_if_missing(dataset_root: Path) -> None:
         print(f"[INFO] Patched missing visual feature names in {info_path}")
 
 
-def _recompute_added_feature_stats(clean_dataset, goal_key: str) -> None:
+def _recompute_added_feature_stats(clean_dataset, goal_key: str, remove_features: list[str]) -> None:
     """
-    Recompute stats.json entries for newly added numeric vector features.
-    We keep existing image/index stats and only update our derived keys.
+    Recompute stats.json AND per-episode stats in meta/episodes parquet for
+    newly added / reindexed features, and clean up orphaned stats columns
+    left over from removed features.
     """
     from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
-    from lerobot.datasets.utils import write_stats
+    from lerobot.datasets.utils import flatten_dict, write_stats
 
     hf = clean_dataset.hf_dataset.with_format(None)
-    target_keys = ["action", "observation.state", goal_key]
+
+    # Derived vector features we added
+    derived_keys = ["action", "observation.state", goal_key]
+    # Scalar/index features whose range changes after split & reindex
+    index_keys = [k for k in ["episode_index", "index", "frame_index", "timestamp", "task_index"]
+                  if k in clean_dataset.meta.features]
+    target_keys = derived_keys + index_keys
 
     for k in target_keys:
         if k not in clean_dataset.meta.features:
@@ -296,6 +294,7 @@ def _recompute_added_feature_stats(clean_dataset, goal_key: str) -> None:
                 f"goal_shape={ep_data[goal_key].shape}"
             )
 
+    # --- 1) Update meta/stats.json (global aggregate) ---
     new_stats = aggregate_stats(ep_stats_list)
     merged_stats = dict(clean_dataset.meta.stats) if clean_dataset.meta.stats is not None else {}
     merged_stats.update(new_stats)
@@ -303,19 +302,65 @@ def _recompute_added_feature_stats(clean_dataset, goal_key: str) -> None:
     print("[INFO] stats.json updated.")
     print("[INFO] added/updated stats keys:", list(new_stats.keys()))
 
+    # --- 2) Update per-episode stats in meta/episodes parquet ---
+    episodes_dir = clean_dataset.root / "meta" / "episodes"
+    ep_parquet_files = sorted(episodes_dir.rglob("*.parquet"))
+    if not ep_parquet_files:
+        print("[WARN] No episode parquet files found, skipping per-episode stats fix.")
+        return
 
-def _sample_train_eval_episodes(total_episodes: int, seed: int) -> tuple[list[int], list[int]]:
-    eval_count = 5
-    if total_episodes <= eval_count:
-        raise ValueError(
-            f"Need more than {eval_count} episodes to create train/eval datasets, got {total_episodes}."
-        )
+    # Pre-flatten all per-episode stats into {col_name: [val_ep0, val_ep1, ...]}
+    all_flat_cols: dict[str, list] = {}
+    for ep_idx, ep_stat in enumerate(ep_stats_list):
+        flat = flatten_dict({"stats": ep_stat})
+        for col_name, value in flat.items():
+            if col_name not in all_flat_cols:
+                all_flat_cols[col_name] = [None] * len(ep_stats_list)
+            if isinstance(value, np.ndarray):
+                # Match existing parquet convention: store as float64 1-D arrays
+                value = value.flatten().astype(np.float64)
+            all_flat_cols[col_name][ep_idx] = value
 
+    for ep_file in ep_parquet_files:
+        df_ep = pd.read_parquet(ep_file)
+
+        # 2a) Remove orphaned stats columns from deleted features
+        orphan_prefixes = [f"stats/{feat}/" for feat in remove_features]
+        cols_to_drop = [c for c in df_ep.columns
+                        if any(c.startswith(prefix) for prefix in orphan_prefixes)]
+        if cols_to_drop:
+            df_ep = df_ep.drop(columns=cols_to_drop)
+            print(f"[INFO] Dropped {len(cols_to_drop)} orphaned stats columns from {ep_file.name}")
+
+        # 2b) Update / add per-episode stats for target_keys
+        ep_indices = df_ep["episode_index"].astype(int).tolist()
+        for col_name, values_by_ep in all_flat_cols.items():
+            col_values = [values_by_ep[ep] for ep in ep_indices]
+            df_ep[col_name] = col_values
+
+        df_ep.to_parquet(ep_file, index=False)
+        print(f"[INFO] Updated per-episode stats in {ep_file}")
+
+
+def _sample_train_eval_episodes(
+    source_ep_counts: list[int], seed: int, n_eval: int = 5,
+) -> tuple[list[int], list[int]]:
+    """Randomly sample n_eval episodes globally for evaluation.
+
+    Args:
+        source_ep_counts: number of episodes in each source folder (in merge order).
+        seed: random seed.
+        n_eval: number of eval episodes to sample globally.
+    Returns:
+        (train_episodes, eval_episodes) as sorted lists of merged episode indices.
+    """
+    total_episodes = sum(source_ep_counts)
+    if n_eval >= total_episodes:
+        raise ValueError(f"n_eval={n_eval} >= total_episodes={total_episodes}")
     rng = random.Random(seed)
-    all_episodes = list(range(total_episodes))
-    eval_episodes = sorted(rng.sample(all_episodes, k=eval_count))
+    eval_episodes = sorted(rng.sample(range(total_episodes), n_eval))
     eval_set = set(eval_episodes)
-    train_episodes = [ep for ep in all_episodes if ep not in eval_set]
+    train_episodes = [ep for ep in range(total_episodes) if ep not in eval_set]
     return train_episodes, eval_episodes
 
 
@@ -395,17 +440,16 @@ def _build_clean_dataset(
     source_dataset,
     output_root: Path,
     output_repo_id: str,
-    tail_ratio: float,
-    goal_reduce: str,
+    goal_tail_frames: int,
     goal_key: str,
 ):
     from lerobot.datasets.dataset_tools import modify_features
 
     episode_to_action, episode_to_state, episode_to_goal = _build_episode_tables(
         source_dataset,
-        tail_ratio=tail_ratio,
-        goal_reduce=goal_reduce,
+        goal_tail_frames=goal_tail_frames,
     )
+    goal_dim = goal_tail_frames * 7
 
     def action_feature_fn(row: dict, ep_idx: int, frame_in_ep: int):
         return episode_to_action[int(ep_idx)][int(frame_in_ep)].tolist()
@@ -438,7 +482,7 @@ def _build_clean_dataset(
             goal_feature_fn,
             {
                 "dtype": "float32",
-                "shape": [1, 7],
+                "shape": [1, goal_dim],
                 "names": None,
             },
         ),
@@ -446,8 +490,9 @@ def _build_clean_dataset(
 
     remove_features = [
         "observation.state.q.Panda201",
+        "observation.state.gripper_width.PandaGripper201",
         "observation.state.q.Panda202",
-        "observation.state.gripper.width.PandaGripper201",
+        "observation.state.gripper_width.PandaGripper202",
         "action.q.Panda202",
         "action.gripper_width.PandaGripper202",
     ]
@@ -465,7 +510,7 @@ def _build_clean_dataset(
     )
 
     _patch_visual_feature_names_if_missing(clean_dataset.root)
-    _recompute_added_feature_stats(clean_dataset, goal_key)
+    _recompute_added_feature_stats(clean_dataset, goal_key, remove_features)
 
     print("[INFO] Clean dataset created.")
     print(f"[INFO] repo_id={clean_dataset.repo_id}")
@@ -478,11 +523,12 @@ def _build_clean_dataset(
     return clean_dataset
 
 
-def _split_train_eval_raw_datasets(merged_dataset, datasets_root: Path, seed: int):
+def _split_train_eval_raw_datasets(
+    merged_dataset, datasets_root: Path, seed: int, source_ep_counts: list[int]
+):
     from lerobot.datasets.dataset_tools import delete_episodes
 
-    total_episodes = int(merged_dataset.meta.total_episodes)
-    train_episodes, eval_episodes = _sample_train_eval_episodes(total_episodes, seed)
+    train_episodes, eval_episodes = _sample_train_eval_episodes(source_ep_counts, seed)
     print(f"[INFO] sampled eval episodes in merged dataset={eval_episodes}")
 
     train_raw_root = datasets_root / "_tmp_beso_train_raw"
@@ -569,11 +615,15 @@ def main():
     if uniq_eps.tolist() != list(range(len(uniq_eps))):
         raise ValueError("Aggregated episode_index is not contiguous after merge; stop and inspect.")
 
+    # Collect per-source episode counts (in merge order) for stratified eval sampling
+    source_ep_counts = [int(ds.meta.total_episodes) for ds in source_datasets]
+
     # 3) Split merged raw dataset first (avoids pandas bug when splitting after derived-feature injection)
     train_raw, eval_raw, train_raw_root, eval_raw_root, train_episodes, eval_episodes = _split_train_eval_raw_datasets(
         merged_dataset=merged_dataset,
         datasets_root=datasets_root,
         seed=args.split_seed,
+        source_ep_counts=source_ep_counts,
     )
 
     _restore_split_video_alignment(
@@ -598,16 +648,14 @@ def main():
         source_dataset=train_raw,
         output_root=train_root,
         output_repo_id="banana_beso_train",
-        tail_ratio=args.tail_ratio,
-        goal_reduce=args.goal_reduce,
+        goal_tail_frames=args.goal_tail_frames,
         goal_key=args.goal_key,
     )
     _build_clean_dataset(
         source_dataset=eval_raw,
         output_root=eval_root,
         output_repo_id="banana_beso_eval",
-        tail_ratio=args.tail_ratio,
-        goal_reduce=args.goal_reduce,
+        goal_tail_frames=args.goal_tail_frames,
         goal_key=args.goal_key,
     )
     _write_split_manifest(train_root, "train", train_episodes)

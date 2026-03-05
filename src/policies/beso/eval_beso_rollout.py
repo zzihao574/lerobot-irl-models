@@ -88,10 +88,13 @@ def _episode_bounds(dataset: LeRobotDataset, ep_idx: int) -> tuple[int, int]:
     return start, end
 
 
-def _collect_pretrained_dirs(checkpoint_path: Path, all_checkpoints: bool) -> list[tuple[int | None, Path]]:
+def _collect_pretrained_dirs(
+    checkpoint_path: Path, all_checkpoints: bool, use_non_ema: bool
+) -> list[tuple[int | None, Path]]:
+    weight_name = "model_non_ema.safetensors" if use_non_ema else "model.safetensors"
     if not all_checkpoints:
-        if not (checkpoint_path / "model.safetensors").exists():
-            raise FileNotFoundError(f"Expected model.safetensors under: {checkpoint_path}")
+        if not (checkpoint_path / weight_name).exists():
+            raise FileNotFoundError(f"Expected {weight_name} under: {checkpoint_path}")
         step = int(checkpoint_path.parent.name) if checkpoint_path.parent.name.isdigit() else None
         return [(step, checkpoint_path)]
 
@@ -110,7 +113,7 @@ def _collect_pretrained_dirs(checkpoint_path: Path, all_checkpoints: bool) -> li
         if not child.is_dir() or not child.name.isdigit():
             continue
         pretrained_dir = child / "pretrained_model"
-        if (pretrained_dir / "model.safetensors").exists():
+        if (pretrained_dir / weight_name).exists():
             out.append((int(child.name), pretrained_dir))
 
     out.sort(key=lambda x: x[0] if x[0] is not None else -1)
@@ -119,12 +122,11 @@ def _collect_pretrained_dirs(checkpoint_path: Path, all_checkpoints: bool) -> li
     return out
 
 
-def _infer_pos_emb_seq_len_from_checkpoint(pretrained_dir: Path) -> int | None:
-    model_path = pretrained_dir / "model.safetensors"
-    if not model_path.exists():
+def _infer_pos_emb_seq_len_from_checkpoint(weight_file: Path) -> int | None:
+    if not weight_file.exists():
         return None
     key = "diffusion.dit_backbone.pos_emb"
-    with safe_open(str(model_path), framework="pt", device="cpu") as f:
+    with safe_open(str(weight_file), framework="pt", device="cpu") as f:
         if key not in f.keys():
             return None
         shape = tuple(f.get_tensor(key).shape)
@@ -143,8 +145,8 @@ def _infer_goal_feature_from_cfg(cfg) -> str | None:
     return None
 
 
-def _align_cfg_with_checkpoint_arch(cfg, pretrained_dir: Path) -> None:
-    pos_seq_len = _infer_pos_emb_seq_len_from_checkpoint(pretrained_dir)
+def _align_cfg_with_checkpoint_arch(cfg, weight_file: Path) -> None:
+    pos_seq_len = _infer_pos_emb_seq_len_from_checkpoint(weight_file)
     n_obs_steps = getattr(cfg, "n_obs_steps", None)
     if pos_seq_len is None or n_obs_steps is None:
         return
@@ -153,25 +155,21 @@ def _align_cfg_with_checkpoint_arch(cfg, pretrained_dir: Path) -> None:
     if pos_seq_len <= n_obs_steps:
         if hasattr(cfg, "goal_conditioned"):
             cfg.goal_conditioned = False
-        if hasattr(cfg, "goal_seq_len"):
-            cfg.goal_seq_len = 0
         return
 
-    goal_seq_len = pos_seq_len - n_obs_steps
+    goal_tokens = pos_seq_len - n_obs_steps
     if hasattr(cfg, "goal_conditioned"):
         cfg.goal_conditioned = True
-    if hasattr(cfg, "goal_seq_len"):
-        cfg.goal_seq_len = goal_seq_len
     if getattr(cfg, "goal_feature", None) in (None, ""):
         goal_feature = _infer_goal_feature_from_cfg(cfg)
         if goal_feature is not None:
             cfg.goal_feature = goal_feature
 
     log.info(
-        "Aligned ckpt arch: n_obs_steps=%d, pos_emb_seq_len=%d, goal_seq_len=%d, goal_feature=%s",
+        "Aligned ckpt arch: n_obs_steps=%d, pos_emb_seq_len=%d, goal_tokens=%d, goal_feature=%s",
         n_obs_steps,
         pos_seq_len,
-        goal_seq_len,
+        goal_tokens,
         getattr(cfg, "goal_feature", None),
     )
 
@@ -391,6 +389,14 @@ def _load_policy(
     device: torch.device,
     use_non_ema: bool = False,
 ) -> BesoPolicy:
+    weight_file = (
+        pretrained_dir / "model_non_ema.safetensors"
+        if use_non_ema
+        else pretrained_dir / "model.safetensors"
+    )
+    if not weight_file.exists():
+        raise FileNotFoundError(f"Weight file not found: {weight_file}")
+
     cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
     # Load BESO-specific fields that draccus doesn't serialize to config.json.
     beso_cfg_file = pretrained_dir / BESO_CONFIG_NAME
@@ -405,14 +411,7 @@ def _load_policy(
     else:
         log.warning("No %s found in %s — BESO sigma/arch params will use BesoConfig defaults", BESO_CONFIG_NAME, pretrained_dir)
     cfg.device = str(device)
-    _align_cfg_with_checkpoint_arch(cfg, pretrained_dir)
-    weight_file = (
-        pretrained_dir / "model_non_ema.safetensors"
-        if use_non_ema
-        else pretrained_dir / "model.safetensors"
-    )
-    if not weight_file.exists():
-        raise FileNotFoundError(f"Weight file not found: {weight_file}")
+    _align_cfg_with_checkpoint_arch(cfg, weight_file)
     # resize_shape fallback: infer from pos_grid in weights for old checkpoints without beso_config.json.
     if not beso_cfg_file.exists():
         with safe_open(str(weight_file), framework="pt") as _sf:
@@ -424,11 +423,10 @@ def _load_policy(
             else:
                 cfg.resize_shape = None
     log.info(
-        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_seq_len=%s goal_feature=%s weights=%s",
+        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_feature=%s weights=%s",
         getattr(cfg, "n_obs_steps", None),
         getattr(cfg, "window_size", None),
         getattr(cfg, "goal_conditioned", None),
-        getattr(cfg, "goal_seq_len", None),
         getattr(cfg, "goal_feature", None),
         weight_file.name,
     )
@@ -457,7 +455,7 @@ def main():
         stats_data_dir = data_dir.parent / "banana_beso_train"
     checkpoint_path = Path(args.checkpoint_path)
     device = torch.device(args.device)
-    ckpts = _collect_pretrained_dirs(checkpoint_path, args.all_checkpoints)
+    ckpts = _collect_pretrained_dirs(checkpoint_path, args.all_checkpoints, args.use_non_ema)
     log.info("Evaluating %d checkpoint(s)", len(ckpts))
     all_results: list[dict] = []
 

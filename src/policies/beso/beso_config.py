@@ -15,7 +15,7 @@ _BESO_EXTRA_FIELDS = [
     "use_pos_emb", "linear_output", "window_size",
     "freeze_rgb_encoder",
     "use_ema", "ema_decay", "ema_update_every_n_steps",
-    "goal_conditioned", "goal_feature", "goal_seq_len", "cond_mask_prob", "cond_lambda",
+    "goal_conditioned", "goal_feature", "cond_mask_prob", "cond_lambda",
     "use_language", "clip_model_name", "freeze_clip", "language_feature",
     "rgb_encoder_lr", "resize_shape",
 ]
@@ -68,7 +68,6 @@ class BesoConfig(DiffusionConfig):
         # Goal conditioning (kept optional; enable when dataset contains goal feature)
         goal_conditioned: bool = False,
         goal_feature: str | None = None,
-        goal_seq_len: int = 1,
         cond_mask_prob: float = 0.1,
         cond_lambda: float = 1.5,  
         # Language instruction parameters
@@ -174,7 +173,6 @@ class BesoConfig(DiffusionConfig):
         # Goal conditioning
         self.goal_conditioned = goal_conditioned
         self.goal_feature = goal_feature
-        self.goal_seq_len = goal_seq_len
 
         # CFG
         self.cond_mask_prob = cond_mask_prob

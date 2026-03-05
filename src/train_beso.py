@@ -49,10 +49,11 @@ def train(data_dir="data", episodes: list[int] | None = None):
 
     policy_overrides = {
         # Experiment overrides on top of BesoConfig defaults.
-        "window_size": 4,
+        "optimizer_lr": 5e-5,
+        "window_size": 5,
+        "down_dims": (),
         "goal_conditioned": False,
         "goal_feature": None,
-        "goal_seq_len": 1,
         "use_amp": True,
         "freeze_rgb_encoder": False,
         "drop_n_last_frames": 0,
@@ -63,7 +64,7 @@ def train(data_dir="data", episodes: list[int] | None = None):
         # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
         "sigma_data": 1.0,
         "sigma_max": 4.0,
-        "do_mask_loss_for_padding": True,
+        "do_mask_loss_for_padding": False,
 
         "normalization_mapping": {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -77,10 +78,10 @@ def train(data_dir="data", episodes: list[int] | None = None):
     cfg = TrainPipelineConfig(
         policy=pretrained_config,
         dataset=dataset_cfg,
-        batch_size=24,
+        batch_size=20,
         num_workers=4,
         steps=30000,
-        save_freq=2000,
+        save_freq=1000,
         log_freq=20,
         wandb=get_wandb_config(),
     )
