@@ -49,7 +49,7 @@ def train(data_dir="data", episodes: list[int] | None = None):
 
     policy_overrides = {
         # Experiment overrides on top of BesoConfig defaults.
-        "optimizer_lr": 5e-5,
+        "optimizer_lr": 1e-4,
         "window_size": 5,
         "down_dims": (),
         "goal_conditioned": False,
@@ -64,7 +64,7 @@ def train(data_dir="data", episodes: list[int] | None = None):
         # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
         "sigma_data": 1.0,
         "sigma_max": 4.0,
-        "do_mask_loss_for_padding": False,
+        "do_mask_loss_for_padding": True,
 
         "normalization_mapping": {
             "VISUAL": NormalizationMode.MEAN_STD,
