@@ -605,6 +605,7 @@ class BesoModel(nn.Module):
             self.config.sigma_sample_density_type,
             self.config.sigma_max,
             self.config.sigma_min,
+            self.sigma_data,
         )(
             shape=(len(trajectory),),
             device=device,
