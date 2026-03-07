@@ -78,6 +78,7 @@ class BesoPolicy(PreTrainedPolicy):
         self._ema_helper = None
         self._ema_updates = 0
         self._ema_applied_for_eval = False
+        self._action_clip_bounds = self._build_action_clip_bounds()
 
     def get_optim_params(self):
         """
@@ -158,6 +159,32 @@ class BesoPolicy(PreTrainedPolicy):
             self._reset_ema_from_current_weights()
         return incompatible
 
+    def _build_action_clip_bounds(self) -> tuple[Tensor, Tensor] | None:
+        stats = self.normalize_targets._tensor_stats.get(ACTION)
+        if not stats or "min" not in stats or "max" not in stats:
+            return None
+
+        action_feature = self.config.output_features.get(ACTION)
+        if action_feature is None:
+            return None
+
+        min_norm = self.normalize_targets._apply_transform(
+            stats["min"], ACTION, action_feature.type, inverse=False
+        )
+        max_norm = self.normalize_targets._apply_transform(
+            stats["max"], ACTION, action_feature.type, inverse=False
+        )
+        return min_norm * 1.1, max_norm * 1.1
+
+    def _clip_norm_actions(self, norm_actions: Tensor) -> Tensor:
+        if self._action_clip_bounds is None:
+            return torch.clamp(norm_actions, -1.1, 1.1)
+
+        lower, upper = self._action_clip_bounds
+        lower = lower.to(device=norm_actions.device, dtype=norm_actions.dtype)
+        upper = upper.to(device=norm_actions.device, dtype=norm_actions.dtype)
+        return torch.max(torch.min(norm_actions, upper), lower)
+
     def _append_obs_queues(self, batch: dict[str, Tensor]):
         """
         Append latest observation tensors to queues without cold-start padding.
@@ -204,7 +231,7 @@ class BesoPolicy(PreTrainedPolicy):
                 queued_batch[key] = value
 
         norm_actions = self.diffusion.generate_actions(queued_batch)
-        norm_actions = torch.clamp(norm_actions, -1.1, 1.1)
+        norm_actions = self._clip_norm_actions(norm_actions)
         env_actions = self.unnormalize_outputs({ACTION: norm_actions})[ACTION]
         return norm_actions, env_actions
 
