@@ -49,7 +49,7 @@ def train(data_dir="data", episodes: list[int] | None = None):
 
     policy_overrides = {
         # Experiment overrides on top of BesoConfig defaults.
-        "optimizer_lr": 1e-4,
+        "optimizer_lr": 8e-5,
         "window_size": 5,
         "down_dims": (),
         "goal_conditioned": False,
@@ -58,16 +58,16 @@ def train(data_dir="data", episodes: list[int] | None = None):
         "freeze_rgb_encoder": False,
         "drop_n_last_frames": 0,
         # resize → random crop data augmentation
-        "crop_shape": (384, 384),
-        "crop_is_random": True,
-        "resize_shape": (420, 420),
+        "crop_shape": None,
+        "crop_is_random": False,
+        "resize_shape": (384, 384),
         # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
         "sigma_data": 1.0,
         "sigma_max": 4.0,
         "do_mask_loss_for_padding": True,
 
         "normalization_mapping": {
-            "VISUAL": NormalizationMode.MEAN_STD,
+            "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         },

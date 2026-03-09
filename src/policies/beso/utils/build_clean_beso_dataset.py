@@ -41,7 +41,18 @@ def _parse_args():
         "--datasets-root",
         type=str,
         default="/home/zzh/workspace/Robot_learning/dataset_new_2",
-        help="Root containing sub-datasets (place_1..place_8, freestyle folders).",
+        help="Base root used to resolve relative paths passed to --source-dirs.",
+    )
+    ap.add_argument(
+        "--source-dirs",
+        type=str,
+        nargs="+",
+        required=True,
+        help=(
+            "Explicit source dataset directories to merge in the given order. "
+            "Supports absolute paths, or paths relative to --datasets-root. "
+            "This argument is required."
+        ),
     )
     ap.add_argument(
         "--merged-tmp-root",
@@ -54,12 +65,6 @@ def _parse_args():
         type=str,
         default="/home/zzh/workspace/Robot_learning/dataset_new_2/banana_beso_clean_v1",
         help="Only used for its parent directory, where banana_beso_train/eval are written.",
-    )
-    ap.add_argument(
-        "--output-repo-id",
-        type=str,
-        default="banana_beso_clean_v1",
-        help="Repo id label stored in LeRobot metadata.",
     )
     ap.add_argument(
         "--goal-tail-frames",
@@ -87,30 +92,33 @@ def _parse_args():
     return ap.parse_args()
 
 
-def _canonical_source_order(root: Path) -> list[Path]:
-    # Fixed order to avoid episode_index ambiguity and to make aggregation deterministic.
-    alias_groups = [[f"place_{i}"] for i in range(1, 9)] + [
-        ["0-10_freestyle", "0-10 freestyle", "0-10_ freestyle"],
-    ]
-    paths: list[Path] = []
-    missing_groups: list[list[str]] = []
-    for aliases in alias_groups:
-        matched = None
-        for name in aliases:
-            p = root / name
-            if p.exists():
-                matched = p
-                break
-        if matched is None:
-            missing_groups.append(aliases)
-        else:
-            paths.append(matched)
+def _resolve_source_paths(datasets_root: Path, source_dirs: list[str] | None) -> list[Path]:
+    if not source_dirs:
+        raise ValueError("--source-dirs is required and cannot be empty")
 
-    if missing_groups:
-        missing_str = ["/".join(group) for group in missing_groups]
-        raise FileNotFoundError(f"Missing dataset folders (any alias works): {missing_str}")
+    resolved: list[Path] = []
+    for raw in source_dirs:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = datasets_root / p
+        p = p.resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Source dataset path not found: {p}")
+        if not p.is_dir():
+            raise NotADirectoryError(f"Source dataset path is not a directory: {p}")
+        resolved.append(p)
 
-    return paths
+    if not resolved:
+        raise ValueError("--source-dirs was provided but no valid paths were resolved")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for p in resolved:
+        if p not in seen:
+            deduped.append(p)
+            seen.add(p)
+
+    return deduped
 
 
 def _tail_flatten(arr: np.ndarray, tail_frames: int) -> np.ndarray:
@@ -575,7 +583,7 @@ def main():
     datasets_root = Path(args.datasets_root)
     output_root = Path(args.output_root)
 
-    source_paths = _canonical_source_order(datasets_root)
+    source_paths = _resolve_source_paths(datasets_root, args.source_dirs)
 
     # 1) Load source datasets in a fixed order
     source_datasets = []

@@ -174,7 +174,7 @@ class BesoPolicy(PreTrainedPolicy):
         max_norm = self.normalize_targets._apply_transform(
             stats["max"], ACTION, action_feature.type, inverse=False
         )
-        return min_norm * 1.1, max_norm * 1.1
+        return min_norm * 1.0, max_norm * 1.0
 
     def _clip_norm_actions(self, norm_actions: Tensor) -> Tensor:
         if self._action_clip_bounds is None:
@@ -778,6 +778,15 @@ class BesoRgbEncoder(nn.Module):
             self.do_crop = False
         # Optional resize (applied before crop, or alone when crop_shape=None)
         self.resize_shape = getattr(config, "resize_shape", None)
+        # self.register_buffer(
+        #     "img_mean",
+        #     torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+        # )
+        # self.register_buffer(
+        #     "img_std",
+        #     torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+        # )
+
 
         # Set up backbone.
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
@@ -832,6 +841,11 @@ class BesoRgbEncoder(nn.Module):
                 x = self.maybe_random_crop(x)
             else:
                 x = self.center_crop(x)
+        
+        # # Normalize RGB to ImageNet stats before entering backbone.
+        # x = (x - self.img_mean.to(device=x.device, dtype=x.dtype)) / self.img_std.to(
+        #     device=x.device, dtype=x.dtype
+        # )
 
         # Extract backbone feature.
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
