@@ -1,0 +1,69 @@
+_target_: policies.beso.beso_config.BesoConfig
+
+device: "cuda"
+push_to_hub: false
+load_non_ema: false
+use_amp: true
+
+window_size: 5
+n_action_steps: 1
+
+sigma_data: 1.0
+sigma_max: 4.0
+sigma_min: 0.005
+sampling_steps: 5
+sigma_sample_density_type: "loglogistic"
+
+embed_dim: 360
+n_layers: 6
+n_heads: 6
+attn_pdrop: 0.2
+resid_pdrop: 0.1
+mlp_pdrop: 0.1
+embed_pdrop: 0.0
+qk_norm: false
+norm_type: "layernorm"
+mlp_type: "gelu"
+mlp_bias: true
+attention_impl: "auto"
+use_pos_emb: true
+linear_output: true
+
+vision_backbone: "resnet18"
+pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+use_group_norm: false
+crop_shape: null
+crop_is_random: false
+resize_shape: [384, 384]
+use_separate_rgb_encoder_per_camera: false
+freeze_rgb_encoder: false
+spatial_softmax_num_keypoints: 32
+
+use_ema: true
+ema_decay: 0.999
+ema_update_every_n_steps: 1
+
+goal_conditioned: false
+goal_feature: null
+
+cond_mask_prob: 0.1
+cond_lambda: 1.5
+
+use_language: false
+clip_model_name: "openai/clip-vit-base-patch32"
+freeze_clip: true
+language_feature: null
+
+down_dims: []
+drop_n_last_frames: 0
+do_mask_loss_for_padding: true
+
+optimizer_lr: 8e-5
+optimizer_betas: [0.9, 0.999]
+scheduler_warmup_steps: 500
+rgb_encoder_lr: 1e-5
+
+normalization_mapping:
+  VISUAL: IDENTITY
+  STATE: MEAN_STD
+  ACTION: MEAN_STD

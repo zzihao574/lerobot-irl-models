@@ -1,136 +1,109 @@
-import argparse
 import os
-import pathlib
+import sys
+from pathlib import Path
 
-_HF_DATASETS_CACHE = pathlib.Path(__file__).resolve().parents[1] / ".hf_datasets_cache"
-_HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
-os.environ["HF_DATASETS_CACHE"] = str(_HF_DATASETS_CACHE)
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
+import hydra
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.configs.types import NormalizationMode
 from lerobot.policies import factory
 from lerobot.scripts.lerobot_train import train as lerobot_train
 from lerobot.utils.utils import init_logging
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 
 from policies.beso.beso_config import BesoConfig
 
 
-def _parse_episodes(spec: str | None) -> list[int] | None:
-    if spec is None or spec.strip() == "":
-        return None
-    episodes: list[int] = []
-    for token in spec.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_s, end_s = token.split("-", 1)
-            start = int(start_s)
-            end = int(end_s)
-            step = 1 if start <= end else -1
-            episodes.extend(range(start, end + step, step))
-        else:
-            episodes.append(int(token))
-    return sorted(set(episodes))
+_HF_DATASETS_CACHE = Path(__file__).resolve().parents[1] / ".hf_datasets_cache"
+_HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ["HF_DATASETS_CACHE"] = str(_HF_DATASETS_CACHE)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
-def train(data_dir="data", episodes: list[int] | None = None):
-    print("\nStarting training...")
-    dataset_cfg = DatasetConfig(
-        repo_id=pathlib.Path(data_dir).name,
-        root=data_dir,
-        episodes=episodes,
-        video_backend="torchcodec",
-    )
-
-    policy_overrides = {
-        # Experiment overrides on top of BesoConfig defaults.
-        "optimizer_lr": 8e-5,
-        "window_size": 5,
-        "down_dims": (),
-        "goal_conditioned": False,
-        "goal_feature": None,
-        "use_amp": True,
-        "freeze_rgb_encoder": False,
-        "drop_n_last_frames": 0,
-        # resize → random crop data augmentation
-        "crop_shape": None,
-        "crop_is_random": False,
-        "resize_shape": (384, 384),
-        # EDM noise schedule: sigma_max >> sigma_data so init is truly blind (SNR=0.01)
-        "sigma_data": 1.0,
-        "sigma_max": 4.0,
-        "do_mask_loss_for_padding": True,
-
-        "normalization_mapping": {
-            "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
-        },
-    }
-    pretrained_config = BesoConfig(push_to_hub=False, **policy_overrides)
-    print(f"[INFO] normalization_mapping={pretrained_config.normalization_mapping}")
-    print(f"[INFO] episodes={episodes}")
-    cfg = TrainPipelineConfig(
-        policy=pretrained_config,
-        dataset=dataset_cfg,
-        batch_size=20,
-        num_workers=4,
-        steps=30000,
-        save_freq=1000,
-        log_freq=20,
-        wandb=get_wandb_config(),
-    )
-
-    init_logging()
+def _build_accelerator(policy_cfg: BesoConfig) -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    force_cpu = pretrained_config.device == "cpu"
-    mixed_precision = "bf16" if pretrained_config.use_amp and not force_cpu else "no"
-    accelerator = Accelerator(
+    force_cpu = policy_cfg.device == "cpu"
+    mixed_precision = "bf16" if policy_cfg.use_amp and not force_cpu else "no"
+    return Accelerator(
         step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp_kwargs],
         cpu=force_cpu,
         mixed_precision=mixed_precision,
     )
-    lerobot_train(cfg, accelerator=accelerator)
-
 
 def get_beso(_typename: str, **_kwargs):
     from policies.beso.modelling_beso import BesoPolicy
 
     return BesoPolicy
 
-
-def get_wandb_config():
-    return WandBConfig(
-        enable=True,
-        project="beso_lerobot",
-        mode="online",
-    )
-
-
-def main():
+@hydra.main(config_path="../configs/beso", config_name="train_beso", version_base="1.3")
+def train(cfg) -> None:
     factory.get_policy_class = get_beso
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data_dir", type=str, required=True, help="Path to the dataset directory"
+
+    dataset_cfg = DatasetConfig(
+        repo_id=cfg.repo_id,
+        root=cfg.dataset_path,
+        video_backend=cfg.video_backend,
     )
-    parser.add_argument(
-        "--episodes",
-        type=str,
-        default=None,
-        help="Subset episodes for training, e.g. '0,1' or '0-3,7'.",
+
+    init_logging()
+
+    if cfg.train.mode == "resume":
+        if not cfg.train.resume_config:
+            raise ValueError("train.resume_config must be set when train.mode=resume")
+        resume_config = Path(cfg.train.resume_config)
+        resume_train_cfg = TrainPipelineConfig.from_pretrained(resume_config)
+
+        if resume_train_cfg.policy is None:
+            raise ValueError(f"No policy found in resume config: {resume_config}")
+
+        resume_train_cfg.policy.load_non_ema = True
+        accelerator = _build_accelerator(resume_train_cfg.policy)
+
+        sys.argv = [
+            sys.argv[0],
+            f"--config_path={resume_config}",
+            "--resume=true",
+            "--policy.load_non_ema=true",
+            f"--dataset.root={Path(cfg.dataset_path)}",
+            f"--dataset.repo_id={cfg.repo_id}",
+        ]
+        lerobot_train(accelerator=accelerator)
+        return
+
+    policy_cfg = hydra.utils.instantiate(cfg.model, _convert_="all")
+
+    if cfg.train.mode == "warmstart":
+        if not cfg.train.checkpoint_path:
+            raise ValueError("train.checkpoint_path must be set when train.mode=warmstart")
+        checkpoint_dir = Path(cfg.train.checkpoint_path)
+        policy_cfg = BesoConfig.from_pretrained(checkpoint_dir)
+        policy_cfg.pretrained_path = checkpoint_dir
+        policy_cfg.load_non_ema = False
+        policy_cfg.push_to_hub = False
+
+    train_cfg = TrainPipelineConfig(
+        policy=policy_cfg,
+        dataset=dataset_cfg,
+        batch_size=cfg.train.batch_size,
+        num_workers=cfg.train.num_workers,
+        steps=cfg.train.steps,
+        save_freq=cfg.train.save_freq,
+        log_freq=cfg.train.log_freq,
+        seed=cfg.train.seed,
+        output_dir=Path(cfg.train.output_dir),
+        job_name=cfg.train.job_name,
+        wandb=WandBConfig(
+            enable=cfg.wandb.enable,
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            mode=cfg.wandb.mode,
+        ),
     )
-    args = parser.parse_args()
-    train(
-        data_dir=pathlib.Path(args.data_dir),
-        episodes=_parse_episodes(args.episodes),
-    )
+
+    accelerator = _build_accelerator(policy_cfg)
+    lerobot_train(train_cfg, accelerator=accelerator)
 
 
 if __name__ == "__main__":
-    main()
+    train()

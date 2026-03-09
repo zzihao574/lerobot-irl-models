@@ -1,5 +1,6 @@
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -51,12 +52,15 @@ class BesoPolicy(PreTrainedPolicy):
             config: Policy configuration class instance or None, in which case the default instantiation of
                 the configuration class is used.
             dataset_meta: LeRobot dataset metadata.
-            dataset_stats: Optional explicit normalization stats override.
+            dataset_stats: Optional stats passed by lerobot factory. If dataset_meta is
+                available, dataset_meta.stats remains the source of truth.
         """
         super().__init__(config)
         config.validate_features()
         self.config = config
-        norm_stats = dataset_stats if dataset_stats is not None else dataset_meta.stats
+        norm_stats = dataset_meta.stats if dataset_meta is not None else dataset_stats
+        if norm_stats is None:
+            raise ValueError("BesoPolicy requires dataset_meta.stats or dataset_stats for normalization.")
         self.normalize_inputs = NormalizerProcessorStep(
             config.input_features, config.normalization_mapping, norm_stats
         )
@@ -150,6 +154,42 @@ class BesoPolicy(PreTrainedPolicy):
             return super()._save_pretrained(save_directory)
         finally:
             self._restore_original_weights()
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_name_or_path,
+        *,
+        config=None,
+        strict: bool = False,
+        **kwargs,
+    ):
+        pretrained_dir = Path(pretrained_name_or_path)
+
+        if config is None:
+            config = cls.config_class.from_pretrained(pretrained_dir)
+
+        weight_name = (
+            "model_non_ema.safetensors"
+            if getattr(config, "load_non_ema", False)
+            else "model.safetensors"
+        )
+        weight_file = pretrained_dir / weight_name
+
+        if not weight_file.exists():
+            raise FileNotFoundError(f"Expected weight file not found: {weight_file}")
+
+        instance = cls(config=config, **kwargs)
+        policy = cls._load_as_safetensor(
+            instance,
+            str(weight_file),
+            str(config.device),
+            strict,
+        )
+        policy.to(config.device)
+        policy.eval()
+        return policy
+
 
     def load_state_dict(self, state_dict, strict: bool = True):
         incompatible = super().load_state_dict(state_dict, strict=strict)
@@ -778,15 +818,14 @@ class BesoRgbEncoder(nn.Module):
             self.do_crop = False
         # Optional resize (applied before crop, or alone when crop_shape=None)
         self.resize_shape = getattr(config, "resize_shape", None)
-        # self.register_buffer(
-        #     "img_mean",
-        #     torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
-        # )
-        # self.register_buffer(
-        #     "img_std",
-        #     torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
-        # )
-
+        self.register_buffer(
+            "img_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "img_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+        )
 
         # Set up backbone.
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
@@ -842,10 +881,10 @@ class BesoRgbEncoder(nn.Module):
             else:
                 x = self.center_crop(x)
         
-        # # Normalize RGB to ImageNet stats before entering backbone.
-        # x = (x - self.img_mean.to(device=x.device, dtype=x.dtype)) / self.img_std.to(
-        #     device=x.device, dtype=x.dtype
-        # )
+        # Normalize RGB to ImageNet stats before entering backbone.
+        x = (x - self.img_mean.to(device=x.device, dtype=x.dtype)) / self.img_std.to(
+            device=x.device, dtype=x.dtype
+        )
 
         # Extract backbone feature.
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)

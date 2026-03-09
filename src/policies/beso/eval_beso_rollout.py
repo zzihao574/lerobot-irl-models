@@ -10,16 +10,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors import safe_open
 from tqdm import tqdm
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.configs.policies import PreTrainedConfig
-from policies.beso.beso_config import BesoConfig, BESO_CONFIG_NAME  # noqa: F401
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from policies.beso.beso_config import BesoConfig
 from policies.beso.modelling_beso import BesoPolicy
 
 # Hardcoded rollout setting
@@ -120,58 +118,6 @@ def _collect_pretrained_dirs(
     if not out:
         raise FileNotFoundError(f"No valid checkpoint/pretrained_model dirs found under {checkpoints_root}")
     return out
-
-
-def _infer_pos_emb_seq_len_from_checkpoint(weight_file: Path) -> int | None:
-    if not weight_file.exists():
-        return None
-    key = "diffusion.dit_backbone.pos_emb"
-    with safe_open(str(weight_file), framework="pt", device="cpu") as f:
-        if key not in f.keys():
-            return None
-        shape = tuple(f.get_tensor(key).shape)
-    if len(shape) != 3:
-        return None
-    return int(shape[1])
-
-
-def _infer_goal_feature_from_cfg(cfg) -> str | None:
-    input_features = getattr(cfg, "input_features", None)
-    if input_features is None:
-        return None
-    for k in input_features.keys():
-        if str(k).startswith("observation.goal"):
-            return str(k)
-    return None
-
-
-def _align_cfg_with_checkpoint_arch(cfg, weight_file: Path) -> None:
-    pos_seq_len = _infer_pos_emb_seq_len_from_checkpoint(weight_file)
-    n_obs_steps = getattr(cfg, "n_obs_steps", None)
-    if pos_seq_len is None or n_obs_steps is None:
-        return
-
-    n_obs_steps = int(n_obs_steps)
-    if pos_seq_len <= n_obs_steps:
-        if hasattr(cfg, "goal_conditioned"):
-            cfg.goal_conditioned = False
-        return
-
-    goal_tokens = pos_seq_len - n_obs_steps
-    if hasattr(cfg, "goal_conditioned"):
-        cfg.goal_conditioned = True
-    if getattr(cfg, "goal_feature", None) in (None, ""):
-        goal_feature = _infer_goal_feature_from_cfg(cfg)
-        if goal_feature is not None:
-            cfg.goal_feature = goal_feature
-
-    log.info(
-        "Aligned ckpt arch: n_obs_steps=%d, pos_emb_seq_len=%d, goal_tokens=%d, goal_feature=%s",
-        n_obs_steps,
-        pos_seq_len,
-        goal_tokens,
-        getattr(cfg, "goal_feature", None),
-    )
 
 
 @dataclass
@@ -384,54 +330,27 @@ def run_rollout_eval(
 @torch.no_grad()
 def _load_policy(
     pretrained_dir: Path,
-    dataset: LeRobotDataset,
-    dataset_stats: dict,
+    policy_meta: LeRobotDatasetMetadata,
     device: torch.device,
     use_non_ema: bool = False,
 ) -> BesoPolicy:
-    weight_file = (
-        pretrained_dir / "model_non_ema.safetensors"
-        if use_non_ema
-        else pretrained_dir / "model.safetensors"
-    )
-    if not weight_file.exists():
-        raise FileNotFoundError(f"Weight file not found: {weight_file}")
-
-    cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
-    # Load BESO-specific fields that draccus doesn't serialize to config.json.
-    beso_cfg_file = pretrained_dir / BESO_CONFIG_NAME
-    if beso_cfg_file.exists():
-        with open(beso_cfg_file) as _f:
-            _extra = json.load(_f)
-        for _k, _v in _extra.items():
-            if _v is not None or not hasattr(cfg, _k):
-                setattr(cfg, _k, _v)
-        log.info("Loaded BESO extra config from %s: %s", BESO_CONFIG_NAME,
-                 {k: _extra[k] for k in ("sigma_data", "sigma_max", "sigma_min", "sampling_steps") if k in _extra})
-    else:
-        log.warning("No %s found in %s — BESO sigma/arch params will use BesoConfig defaults", BESO_CONFIG_NAME, pretrained_dir)
+    cfg = BesoConfig.from_pretrained(pretrained_dir)
     cfg.device = str(device)
-    _align_cfg_with_checkpoint_arch(cfg, weight_file)
-    # resize_shape fallback: infer from pos_grid in weights for old checkpoints without beso_config.json.
-    if not beso_cfg_file.exists():
-        with safe_open(str(weight_file), framework="pt") as _sf:
-            _pg = next((k for k in _sf.keys() if k.endswith(".pool.pos_grid")), None)
-            if _pg is not None:
-                _n = _sf.get_tensor(_pg).shape[0]
-                _side = round(_n ** 0.5)
-                cfg.resize_shape = (_side * 32, _side * 32) if _side * _side == _n else None
-            else:
-                cfg.resize_shape = None
+    cfg.load_non_ema = use_non_ema
     log.info(
-        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_feature=%s weights=%s",
+        "Load cfg resolved: n_obs_steps=%s window_size=%s goal_conditioned=%s goal_feature=%s load_non_ema=%s",
         getattr(cfg, "n_obs_steps", None),
         getattr(cfg, "window_size", None),
         getattr(cfg, "goal_conditioned", None),
         getattr(cfg, "goal_feature", None),
-        weight_file.name,
+        getattr(cfg, "load_non_ema", None),
     )
-    policy = BesoPolicy(config=cfg, dataset_meta=dataset.meta, dataset_stats=dataset_stats)
-    policy = BesoPolicy._load_as_safetensor(policy, str(weight_file), str(device), strict=False)
+    policy = BesoPolicy.from_pretrained(
+        pretrained_dir,
+        config=cfg,
+        dataset_meta=policy_meta,
+        strict=False,
+    )
     policy = policy.to(device)
     policy.eval()
     return policy
@@ -470,13 +389,15 @@ def main():
     stats_path = stats_data_dir / "meta" / "stats.json"
     if not stats_path.exists():
         raise FileNotFoundError(f"stats.json not found: {stats_path}")
-    with open(stats_path, "r", encoding="utf-8") as f:
-        dataset_stats = json.load(f)
+    policy_meta = LeRobotDatasetMetadata(
+        repo_id=stats_data_dir.name,
+        root=stats_data_dir,
+    )
     eval_episodes = list(range(int(dataset.meta.total_episodes)))
     log.info("Loaded eval dataset: %s", data_dir)
-    log.info("Loaded normalization stats from: %s", stats_data_dir)
+    log.info("Loaded normalization metadata from: %s", stats_data_dir)
     log.info("eval episodes=%s", eval_episodes)
-    print(f"[INFO] normalization stats source: {stats_data_dir}")
+    print(f"[INFO] normalization metadata source: {stats_data_dir}")
 
     wandb_run = None
     if args.wandb:
@@ -503,8 +424,7 @@ def main():
         log.info("Loading policy from %s", pretrained_dir)
         policy = _load_policy(
             pretrained_dir,
-            dataset=dataset,
-            dataset_stats=dataset_stats,
+            policy_meta=policy_meta,
             device=device,
             use_non_ema=args.use_non_ema,
         )
