@@ -75,6 +75,13 @@ class BesoConfig(DiffusionConfig):
     # Runtime load behavior.
     load_non_ema: bool = False
 
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        cfg = PreTrainedConfig.from_pretrained(pretrained_name_or_path, **kwargs)
+        if not isinstance(cfg, cls):
+            raise TypeError(f"Expected {cls.__name__} from checkpoint, got {type(cfg).__name__}")
+        return cfg
+
     def __post_init__(self) -> None:
         if self.window_size is not None:
             self.n_obs_steps = self.window_size
