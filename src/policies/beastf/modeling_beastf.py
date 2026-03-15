@@ -10,7 +10,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_file as load_safetensors_file
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
@@ -184,9 +184,6 @@ class BeastVLAPolicy(nn.Module):
     
     def get_optim_params(self) -> dict:
         return self.model.parameters()
-    
-
-
 class BeastFModel(nn.Module):
     def __init__(self, config: BeastVLAConfig, task: str = ""):
         super().__init__()
@@ -238,8 +235,17 @@ class BeastFModel(nn.Module):
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
+
+        vlm_config = AutoConfig.from_pretrained(vlm_path, trust_remote_code=True)
+        vlm_config._attn_implementation = "eager"
+        if getattr(vlm_config, "text_config", None) is not None:
+            vlm_config.text_config._attn_implementation = "eager"
+
         self.vlm = AutoModelForCausalLM.from_pretrained(
-            vlm_path, trust_remote_code=True, attn_implementation="eager"
+            vlm_path,
+            config=vlm_config,
+            trust_remote_code=True,
+            attn_implementation="eager",
         )
         
         if freeze_florence:

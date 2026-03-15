@@ -109,3 +109,10 @@ class BeastVLAConfig(PreTrainedConfig):
         # Keep this lightweight; the policy will raise KeyError if dataset keys mismatch.
         if "action" not in self.output_features:
             raise ValueError("BeastVLAConfig.output_features must contain 'action'.")
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        cfg = PreTrainedConfig.from_pretrained(pretrained_name_or_path, **kwargs)
+        if not isinstance(cfg, cls):
+            raise TypeError(f"Expected {cls.__name__} from checkpoint, got {type(cfg).__name__}")
+        return cfg
