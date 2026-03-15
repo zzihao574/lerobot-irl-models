@@ -52,33 +52,36 @@ def train(cfg) -> None:
         if not cfg.train.resume_config:
             raise ValueError("train.resume_config must be set when train.mode=resume")
         resume_config = Path(cfg.train.resume_config)
-        resume_train_cfg = TrainPipelineConfig.from_pretrained(resume_config)
+        resume_train_cfg = TrainPipelineConfig.from_pretrained(
+            resume_config,
+            cli_args=[
+                "--resume=true",
+                "--policy.load_non_ema=true",
+                f"--dataset.root={Path(cfg.dataset_path)}",
+                f"--dataset.repo_id={cfg.repo_id}",
+            ],
+        )
 
         if resume_train_cfg.policy is None:
             raise ValueError(f"No policy found in resume config: {resume_config}")
 
-        resume_train_cfg.policy.load_non_ema = True
         accelerator = _build_accelerator(resume_train_cfg.policy)
 
         sys.argv = [
             sys.argv[0],
             f"--config_path={resume_config}",
-            "--resume=true",
-            "--policy.load_non_ema=true",
-            f"--dataset.root={Path(cfg.dataset_path)}",
-            f"--dataset.repo_id={cfg.repo_id}",
         ]
-        lerobot_train(accelerator=accelerator)
+        lerobot_train(resume_train_cfg, accelerator=accelerator)
         return
 
     policy_cfg = hydra.utils.instantiate(cfg.model, _convert_="all")
 
     if cfg.train.mode == "warmstart":
-        if not cfg.train.checkpoint_path:
-            raise ValueError("train.checkpoint_path must be set when train.mode=warmstart")
-        checkpoint_dir = Path(cfg.train.checkpoint_path)
-        policy_cfg = BesoConfig.from_pretrained(checkpoint_dir)
-        policy_cfg.pretrained_path = checkpoint_dir
+        if not cfg.train.pretrained_model_path:
+            raise ValueError("train.pretrained_model_path must be set when train.mode=warmstart")
+        pretrained_model_dir = Path(cfg.train.pretrained_model_path)
+        policy_cfg = BesoConfig.from_pretrained(pretrained_model_dir)
+        policy_cfg.pretrained_path = pretrained_model_dir
         policy_cfg.load_non_ema = False
         policy_cfg.push_to_hub = False
 
