@@ -12,13 +12,12 @@ from lerobot.policies import factory
 from lerobot.scripts.lerobot_train import train as lerobot_train
 from lerobot.utils.utils import init_logging
 
+project_root = Path(__file__).parent.parent
+
 from policies.beastf.beastf_config import BeastVLAConfig
 from policies.beastf.modeling_beastf import BeastVLAPolicy
 
 os.environ["LEROBOT_VIDEO_BACKEND"] = "pyav"
-
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
 log = logging.getLogger(__name__)
 
 
@@ -26,6 +25,8 @@ log = logging.getLogger(__name__)
     config_path="../configs", config_name="config", version_base="1.3"
 )
 def train(cfg):
+    # _patch_lerobot_dataset_task_field()
+
     dataset_cfg = DatasetConfig(
         repo_id=cfg.repo_id,
         root=cfg.dataset_path,
@@ -53,15 +54,14 @@ def train(cfg):
         entity=cfg.wandb.entity,
         mode=cfg.wandb.mode,
         ),
-    )
+	    )
 
-    policy = BeastVLAPolicy(pretrained_config)
+    policy = BeastVLAPolicy(pretrained_config, task=cfg.task)
 
     train_cfg.pretrained_policy = policy
 
     init_logging()
     lerobot_train(train_cfg)
-
 
 def get_beast(typename: str, **kwargs):
     return BeastVLAPolicy

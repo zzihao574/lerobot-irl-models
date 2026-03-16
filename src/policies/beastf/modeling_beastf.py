@@ -1,16 +1,12 @@
 import logging
-import os
 from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
-from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
-from safetensors.torch import load_file as load_safetensors_file
-from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+from lerobot.policies.pretrained import PreTrainedPolicy
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
@@ -28,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 
-class BeastVLAPolicy(nn.Module):
+class BeastVLAPolicy(PreTrainedPolicy):
     """
     BeastVLA Policy for LeRobot.
     """
@@ -42,7 +38,7 @@ class BeastVLAPolicy(nn.Module):
         task: str = "",
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(config)
         if dataset_stats is None and hasattr(config, '_dataset_stats'):
             dataset_stats = config._dataset_stats
             
@@ -62,68 +58,8 @@ class BeastVLAPolicy(nn.Module):
         self.model = BeastFModel(config, task=task)
         self.model.reset()
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_name_or_path: str,
-        *,
-        config: BeastVLAConfig,
-        dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-        task: str = "",
-        strict: bool = False,
-        revision: str | None = None,
-        cache_dir: str | None = None,
-        token: str | bool | None = None,
-        local_files_only: bool = False,
-        **kwargs,
-    ) -> "BeastVLAPolicy":
-        """
-        Load a BeastVLAPolicy from a local path (file or directory) or a HF Hub repo id.
-
-        Notes:
-          - This is a minimal loader that avoids importing `lerobot.policies` (which can be slow/heavy).
-          - `config` must be provided explicitly.
-        """
-        model_id = str(pretrained_name_or_path)
-        if model_id.endswith(".safetensors"):
-            model_file = model_id
-        elif torch.jit.is_scripting():
-            raise RuntimeError("from_pretrained is not supported under torchscript.")
-        else:
-            if os.path.isdir(model_id):
-                model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            else:
-                try:
-                    model_file = hf_hub_download(
-                        repo_id=model_id,
-                        filename=SAFETENSORS_SINGLE_FILE,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        token=token,
-                        local_files_only=local_files_only,
-                    )
-                except HfHubHTTPError as e:
-                    raise FileNotFoundError(
-                        f"{SAFETENSORS_SINGLE_FILE} not found for '{model_id}' (local dir or HF repo id)."
-                    ) from e
-
-        policy = cls(config, dataset_stats=dataset_stats, task=task, **kwargs)
-        state_dict = load_safetensors_file(model_file)
-        missing, unexpected = policy.load_state_dict(state_dict, strict=strict)
-        if missing:
-            logger.warning("Missing keys when loading: %s", missing)
-        if unexpected:
-            logger.warning("Unexpected keys when loading: %s", unexpected)
-
-        policy.to(config.device)
-        policy.eval()
-        return policy
-
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-
         batch = self.normalize_inputs(batch)
-        logging.info(f"shape of observation.state: {batch['observation.state'].shape}")
-
         batch = self.normalize_targets(batch)
         result = self.model.forward(batch)
         return result["loss"], result["loss_dict"]
@@ -184,6 +120,9 @@ class BeastVLAPolicy(nn.Module):
     
     def get_optim_params(self) -> dict:
         return self.model.parameters()
+    
+
+
 class BeastFModel(nn.Module):
     def __init__(self, config: BeastVLAConfig, task: str = ""):
         super().__init__()
@@ -223,15 +162,9 @@ class BeastFModel(nn.Module):
         self.use_second_view = config.use_second_view
         self.vlm_prompt_style = config.vlm_prompt_style
         self.token_dropout = config.token_dropout
-        self.use_proprio = config.use_proprio
+        # self.use_proprio = config.use_proprio
         self.return_act_chunk = config.return_act_chunk
         self.second_view_key = config.second_view_key
-
-        # Initialize proprioceptive encoder if needed
-        if self.use_proprio:
-            # Assume state_dim is known or from config
-            state_dim = getattr(config, 'state_dim', 14)  # Default for common robots
-            self.proprio_encoder = nn.Linear(state_dim, self.vlm.config.hidden_size).to(self.device)
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
@@ -298,8 +231,6 @@ class BeastFModel(nn.Module):
         self.to(self.device)
         self.vlm.to(self.device)
         self.action_tokenizer.to(self.device) # Ensure tokenizer buffers are on device
-        if hasattr(self, 'proprio_encoder'):
-            self.proprio_encoder.to(self.device)
 
     def _bins_to_llm_ids(self, bin_ids: torch.Tensor) -> torch.Tensor:
         """Convert BeastTokenizer bins to VLM token IDs."""
@@ -365,10 +296,6 @@ class BeastFModel(nn.Module):
             llm_label_ids.view(-1),
         )
 
-        print("loss.requires_grad:", masked_lm_loss.requires_grad)
-        print("loss.grad_fn:", masked_lm_loss.grad_fn)
-        print("num trainable:", sum(p.numel() for p in self.parameters() if p.requires_grad))
-
         # 7. Metrics (Optional)
         with torch.no_grad():
             pred_ids = torch.argmax(lm_logits, dim=-1)
@@ -412,7 +339,6 @@ class BeastFModel(nn.Module):
 
         # Text encoding
         txt = batch.get("task", self.task)
-        logging.info(f"Encoding task: {txt}")
         if not isinstance(txt, list):
             if isinstance(txt, str):
                 txt = [txt] * B
@@ -431,28 +357,14 @@ class BeastFModel(nn.Module):
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
         
-        # Proprioceptive encoding
-        proprio_embeds = None
-        if self.use_proprio and "observation.state" in batch:
-            proprio_tensor = batch["observation.state"].to(device).to(default_dtype)
-            if len(proprio_tensor.shape) == 2:  # [B, state_dim]
-                proprio_tensor = proprio_tensor.unsqueeze(1)  # [B, 1, state_dim]
-            proprio_embeds = self.proprio_encoder(proprio_tensor)  # [B, T, hidden_size]
-            proprio_embeds = proprio_embeds.view(B, -1, proprio_embeds.shape[-1])  # Flatten if needed
-        
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        components = [task_prompt, image_features, text_embeds]
-        merged = torch.cat(components, dim=1)
+        merged = torch.cat([task_prompt, image_features, text_embeds], dim=1)
         
         # Masks
         vis_mask = torch.ones(image_features.shape[:2], device=device)
         prompt_mask = torch.ones(B, 1, dtype=torch.long, device=device)
-        masks = [prompt_mask, vis_mask, tokens["attention_mask"]]
-        if proprio_embeds is not None:
-            proprio_mask = torch.ones(proprio_embeds.shape[:2], device=device)
-            masks.append(proprio_mask)
-        attn_mask = torch.cat(masks, dim=1)
+        attn_mask = torch.cat([prompt_mask, vis_mask, tokens["attention_mask"]], dim=1)
 
         features = self.vlm.get_encoder()(
             inputs_embeds=merged, attention_mask=attn_mask

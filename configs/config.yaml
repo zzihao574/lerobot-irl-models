@@ -1,17 +1,18 @@
-repo_id: pepper_only
-dataset_path: /hkfs/work/workspace/scratch/usmrd-MemVLA/datasets/lerobot/pepper_only
-checkpoint_path: /home/hk-project-p0024638/usmrd/model_weights/flower_pret/360000_model_weights.pt
+repo_id: beastf
+dataset_path: /home/jing/zihao_zhang/beastf_datasets/fold_the_towel_all/home/jing/zihao_zhang/fold_the_towel_all
+task: "fold_the_towel"
+checkpoint_path: /home/jing/lerobot-irl-models/src/outputs
 
 train:
-  batch_size: 64 #64
-  steps: 40000 #40000
-  save_freq: 5000
+  batch_size: 1 #64
+  steps: 2 #40000
+  save_freq: 1
   seed: 42
   device: cuda
-  num_workers: 4
+  num_workers: 0
   log_freq: 100
-  output_dir: "./output/flower/"
-  job_name: "model_training"
+  output_dir: "./output/beastf/"
+  job_name: "beastf_training"
   push_to_hub: false
   #Only pi0/pi05
   gradient_checkpointing: true
@@ -20,5 +21,5 @@ train:
 wandb:
   enable: false
   project: "lerobot-training"
-  entity: "your-wandb-entity"
+  entity: ""
   mode: "disabled"  # "online", "offline", "disabled"
