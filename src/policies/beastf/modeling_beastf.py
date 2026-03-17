@@ -53,11 +53,11 @@ class BeastVLAPolicy(PreTrainedPolicy):
         return self.forward(batch)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def predict_action_chunk(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         cond = self.model.encode_observations(batch)
-        action_seq = self.model.sample_actions(None, cond, inference=True)
-        action_seq = self.unnormalize_outputs({ACTION: action_seq})[ACTION]
-        return action_seq
+        norm_action_seq = self.model.sample_actions(None, cond, inference=True)
+        env_action_seq = self.unnormalize_outputs({ACTION: norm_action_seq})[ACTION]
+        return norm_action_seq, env_action_seq
 
     def reset(self) -> None:
         self.model.reset()
@@ -81,19 +81,22 @@ class BeastVLAPolicy(PreTrainedPolicy):
         # Check if we need to predict a new action chunk
         if (
             self.model.rollout_step_counter % self.config.multistep == 0
-            or self.model.pred_action_seq is None
+            or self.model.pred_action_seq_norm is None
+            or self.model.pred_action_seq_env is None
         ):
             # Predict new action chunk
-            self.model.pred_action_seq = self.predict_action_chunk(batch)
+            (
+                self.model.pred_action_seq_norm,
+                self.model.pred_action_seq_env,
+            ) = self.predict_action_chunk(batch)
 
         # Get current action from the chunk
         if self.config.return_act_chunk:
             # Return full chunk
-            action = self.model.pred_action_seq
+            action = self.model.pred_action_seq_env
         else:
             # Return single action at current step
-            # action = self.model.pred_action_seq
-            action = self.model.pred_action_seq[:, self.model.rollout_step_counter, :]
+            action = self.model.pred_action_seq_env[:, self.model.rollout_step_counter, :]
 
         # Update counter
         self.model.rollout_step_counter += 1
@@ -133,7 +136,8 @@ class BeastFModel(nn.Module):
         self._setup_action_tokenizer(config)
 
         self.rollout_step_counter = 0
-        self.pred_action_seq = None
+        self.pred_action_seq_norm = None
+        self.pred_action_seq_env = None
         self.ensure_device_consistency()
 
     def _init_modalities(self, config):
@@ -439,9 +443,9 @@ class BeastFModel(nn.Module):
         # Use init_pos relative reconstruction if needed (logic from original beast_florence)
         # beast.py decode_discrete accepts init_pos
         init_pos = None
-        if self.pred_action_seq is not None and self.action_tokenizer.enforce_init_pos:
+        if self.pred_action_seq_norm is not None and self.action_tokenizer.enforce_init_pos:
             # Use last action of previous chunk as start of next
-            init_pos = self.pred_action_seq[:, -1, ...]
+            init_pos = self.pred_action_seq_norm[:, -1, ...]
             
         actions = self.action_tokenizer.decode_discrete(pred_bins, init_pos=init_pos)
         
@@ -449,5 +453,6 @@ class BeastFModel(nn.Module):
 
     def reset(self):
         self.rollout_step_counter = 0
-        self.pred_action_seq = None
+        self.pred_action_seq_norm = None
+        self.pred_action_seq_env = None
         self.eval()

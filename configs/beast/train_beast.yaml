@@ -5,7 +5,7 @@ defaults:
 base_output_dir: ./output/train/beast/${now:%Y-%m-%d}/${now:%H-%M-%S}
 repo_id: "beastf"
 dataset_path: "/home/zzh/workspace/Robot_learning/datasets/fold_the_towel_all"
-video_backend: "pyav"
+video_backend: "torchcodec"
 
 hydra:
   run:

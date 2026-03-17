@@ -26,6 +26,9 @@ class BeastVLAConfig(SmolVLAConfig):
     )
 
     vlm_path: str = "microsoft/Florence-2-base"
+    vlm_model_name: str = "bert-base-uncased"
+    tokenizer_max_length: int = 77
+    pad_language_to: str = "longest"
     freeze_florence: bool = False
     freeze_vision_tower: bool = False
     freeze_embeddings_only: bool = False
@@ -70,6 +73,13 @@ class BeastVLAConfig(SmolVLAConfig):
     scheduler_warmup_steps: int = 1000
     scheduler_decay_steps: int = 400_000
     scheduler_decay_lr: float = 1e-5
+
+    def __post_init__(self) -> None:
+        self.chunk_size = self.act_window_size
+        self.n_action_steps = self.multistep
+        self.tokenizer_max_length = self.text_max_length
+        self.pad_language_to = "longest"
+        super().__post_init__()
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
