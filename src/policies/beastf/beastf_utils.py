@@ -1,5 +1,23 @@
 import torch
 
+
+def build_policy_prompt(
+    instruction: str,
+    robot_name: str,
+    num_arms: int,
+    action_space: str,
+    include_meta: bool = True,
+) -> str:
+    instruction = instruction.strip()
+    if include_meta:
+        return (
+            f"Agent Type: {num_arms}-arm {robot_name}, "
+            f"Action Space: {action_space}, "
+            f"Task Instruction: {instruction}"
+        )
+    return f"Task Instruction: {instruction}"
+
+
 def create_bidirectional_mask(batch_size, seq_length, device):
     """
     In a bidirectional mask, every token can attend to every other token,

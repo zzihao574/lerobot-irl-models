@@ -1,0 +1,32 @@
+defaults:
+  - model: beast
+  - _self_
+
+base_output_dir: ./output/train/beast/${now:%Y-%m-%d}/${now:%H-%M-%S}
+repo_id: "beastf"
+dataset_path: "/home/zzh/workspace/Robot_learning/datasets/fold_the_towel_all"
+task: "fold the towel"
+video_backend: "pyav"
+
+hydra:
+  run:
+    dir: ${base_output_dir}/hydra
+
+wandb:
+  enable: true
+  project: "beast-training"
+  entity: null
+  mode: "online"
+
+train:
+  batch_size: 1
+  num_workers: 0
+  steps: 2
+  save_freq: 1
+  log_freq: 100
+  seed: 42
+  device: "cuda"
+  output_dir: ${base_output_dir}/model_outputs
+  job_name: "beast_${now:%Y-%m-%d}_${now:%H-%M-%S}"
+  push_to_hub: false
+

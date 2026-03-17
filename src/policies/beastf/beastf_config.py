@@ -1,92 +1,89 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
 
 @PreTrainedConfig.register_subclass("beast_vla")
+@dataclass
 class BeastVLAConfig(SmolVLAConfig):
-    def __init__(
-        self,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.obs_modalities = "observation"
-        self.goal_modalities = "task"
-        self.target_modality = "action"
-        self.lang_modalities = ["language_instruction"]
-        # LeRobot dataset keys are typically fully-qualified (e.g. "observation.image.centric_cam").
-        # Keep these aligned with the dataset to avoid KeyError in the policy.
-        self.img_modalities = ["observation.image.centric_cam"]
-        
-        # Define input and output features for normalization
-        self.input_features = {
-            "observation.image.centric_cam": PolicyFeature(
-                type=FeatureType.VISUAL, shape=(3, 256, 256)
-            ),
-            "observation.image.wrist_cam": PolicyFeature(
-                type=FeatureType.VISUAL, shape=(3, 256, 256)
-            ),
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
-        }
-        self.output_features = {
-            "action": PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
-        }
-        
-        self.normalization_mapping = {
-            FeatureType.STATE: NormalizationMode.MEAN_STD,
-            FeatureType.ACTION: NormalizationMode.MEAN_STD,
-        }
-        
-        # VLM configuration
-        self.vlm_path: str = "microsoft/Florence-2-base"
-        self.freeze_florence: bool = False
-        self.freeze_vision_tower: bool = False
-        self.freeze_embeddings_only: bool = False
-        self.vlm_prompt_style: str = "default"
-        self.token_dropout: float = 0.1
-        self.cfg_dropout: float = 0.0
-        self.cfg_lambda: float = 1.0
-        # Action and observation configuration
-        self.action_dim: int = 8
-        self.act_window_size: int = 30
-        self.chunk_size: int = 30
-        self.multistep: int = 30
-        self.lowdim_obs_dim: int = 30
-        # Image configuration
-        self.use_second_view: bool = True
-        self.second_view_key: str = "observation.image.wrist_cam"
-        # Beast Tokenizer configuration
-        self.num_dof: int = 8
-        # B-spline parameters
-        self.gripper_zero_order: bool = False
-        self.num_basis: int = 5
-        self.degree_p: int = 4
-        self.action_bins: int = 256
-        self.update_w_bound: bool = True
-        # Action output configuration
-        self.return_act_chunk: bool = False
-        # Additional features
-        self.use_action_scale: bool = False
-        self.use_early_cross_fusion: bool = True
+    obs_modalities: str = "observation"
+    goal_modalities: str = "task"
+    target_modality: str = "action"
+    lang_modalities: list[str] = field(default_factory=lambda: ["language_instruction"])
+    img_modalities: list[str] = field(default_factory=lambda: ["observation.image.centric_cam"])
 
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.MEAN_STD,
+        }
+    )
+
+    vlm_path: str = "microsoft/Florence-2-base"
+    freeze_florence: bool = False
+    freeze_vision_tower: bool = False
+    freeze_embeddings_only: bool = False
+    token_dropout: float = 0.1
+    cfg_dropout: float = 0.0
+    cfg_lambda: float = 1.0
+    prompt_robot_name: str = "Franka Panda"
+    prompt_num_arms: int = 1
+    prompt_action_space: str = "7 joint positions + 1 gripper width"
+    prompt_include_meta: bool = True
+    image_resize_hw: tuple[int, int] = (224, 224)
+    image_use_clip_normalization: bool = True
+    image_mean: tuple[float, float, float] = (0.48145466, 0.4578275, 0.40821073)
+    image_std: tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
+
+    action_dim: int = 8
+    act_window_size: int = 30
+    chunk_size: int = 30
+    n_action_steps: int = 30
+    multistep: int = 30
+    lowdim_obs_dim: int = 30
+
+    use_second_view: bool = True
+    second_view_key: str = "observation.image.wrist_cam"
+
+    num_dof: int = 8
+    gripper_dof: int = 1
+    gripper_zero_order: bool = False
+    enforce_init_pos: bool = True
+    num_basis: int = 5
+    degree_p: int = 4
+    action_bins: int = 256
+    update_w_bound: bool = True
+    text_max_length: int = 77
+
+    return_act_chunk: bool = False
+    use_action_scale: bool = False
+    use_early_cross_fusion: bool = True
+
+    optimizer_lr: float = 2e-5
+    optimizer_betas: tuple[float, float] = (0.9, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 1e-4
+    scheduler_warmup_steps: int = 1000
+    scheduler_decay_steps: int = 400_000
+    scheduler_decay_lr: float = 1e-5
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
-            lr=2e-5,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=1e-4,
+            lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
+            weight_decay=self.optimizer_weight_decay,
         )
 
     def get_scheduler_preset(self):
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=1000,
-            num_decay_steps=400_000,
-            peak_lr=2e-5,
-            decay_lr=1e-5,
+            num_warmup_steps=self.scheduler_warmup_steps,
+            num_decay_steps=self.scheduler_decay_steps,
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
         )

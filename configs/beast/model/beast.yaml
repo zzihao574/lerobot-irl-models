@@ -1,0 +1,28 @@
+_target_: policies.beastf.beastf_config.BeastVLAConfig
+
+use_amp: true
+
+vlm_path: "microsoft/Florence-2-base"
+prompt_robot_name: "Franka Panda"
+prompt_num_arms: 1
+prompt_action_space: "7 joint positions + 1 gripper width"
+prompt_include_meta: true
+image_resize_hw: [224, 224]
+image_use_clip_normalization: true
+image_mean: [0.48145466, 0.4578275, 0.40821073]
+image_std: [0.26862954, 0.26130258, 0.27577711]
+
+act_window_size: 30
+chunk_size: 30
+multistep: 30
+
+num_basis: 5
+num_dof: 8
+action_dim: 8
+gripper_dof: 1
+gripper_zero_order: false
+enforce_init_pos: true
+
+text_max_length: 77
+use_second_view: true
+second_view_key: "observation.image.wrist_cam"

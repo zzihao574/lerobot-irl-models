@@ -119,7 +119,7 @@ class BeastTokenizer(torch.nn.Module):
     
     def _apply_initial_position_constraint(self, params, init_pos):
         """Apply initial position constraint to parameters."""
-        if not self.init_pos or init_pos is None:
+        if (not self.enforce_init_pos) or (init_pos is None):
             return params
             
         # Reshape to access individual basis functions

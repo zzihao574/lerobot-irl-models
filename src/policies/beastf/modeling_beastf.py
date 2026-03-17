@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,17 +11,15 @@ from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
 from .beast_tokenizer.beast import BeastTokenizer
-from .beastf_utils import create_bidirectional_mask, token_prediction_accuracy
+from .beastf_utils import build_policy_prompt, create_bidirectional_mask, token_prediction_accuracy
 
 from lerobot.processor.normalize_processor import (
     NormalizerProcessorStep,
     UnnormalizerProcessorStep,
 )
 from lerobot.utils.constants import ACTION
-import hydra 
 
 logger = logging.getLogger(__name__)
-
 
 
 class BeastVLAPolicy(PreTrainedPolicy):
@@ -160,11 +158,20 @@ class BeastFModel(nn.Module):
 
     def _init_flags(self, config):
         self.use_second_view = config.use_second_view
-        self.vlm_prompt_style = config.vlm_prompt_style
         self.token_dropout = config.token_dropout
         # self.use_proprio = config.use_proprio
         self.return_act_chunk = config.return_act_chunk
         self.second_view_key = config.second_view_key
+        self.text_max_length = config.text_max_length
+        self.prompt_robot_name = config.prompt_robot_name
+        self.prompt_num_arms = config.prompt_num_arms
+        self.prompt_action_space = config.prompt_action_space
+        self.prompt_include_meta = config.prompt_include_meta
+        self.image_resize_hw = tuple(config.image_resize_hw)
+        self.image_use_clip_normalization = config.image_use_clip_normalization
+        self.image_mean = tuple(config.image_mean)
+        self.image_std = tuple(config.image_std)
+        self._logged_prompt_example = False
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
@@ -193,6 +200,7 @@ class BeastFModel(nn.Module):
         self.tokenizer = self.processor.tokenizer
         
         self.prompt_embeds = self._create_prompt_embed("<Primitives>").to(self.device)
+        self.vlm_vocab_size = self.vlm.language_model.get_output_embeddings().weight.shape[0] - 1
 
     def _setup_action_tokenizer(self, config: BeastVLAConfig) -> None:
         """
@@ -208,13 +216,13 @@ class BeastFModel(nn.Module):
             seq_len=config.act_window_size,
             vocab_size=self.action_bins,  # Beast divides range into this many bins
             degree_p=getattr(config, "degree_p", 4),
+            gripper_zero_order=config.gripper_zero_order,
+            gripper_dof=config.gripper_dof,
+            enforce_init_pos=config.enforce_init_pos,
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound
-
-        # use <loc_0> as the starting token for action tokens 
-        self.action_token_start_id = self.tokenizer.convert_tokens_to_ids("<loc_0>")
-        logger.info(f"Action tokens start at ID: {self.action_token_start_id}")
+        logger.info("Using tail-of-vocabulary mapping for BEAST action tokens.")
 
     def _create_prompt_embed(self, prompt_text: str) -> nn.Parameter:
         self.tokenizer.add_special_tokens({"additional_special_tokens": [prompt_text]})
@@ -234,13 +242,33 @@ class BeastFModel(nn.Module):
 
     def _bins_to_llm_ids(self, bin_ids: torch.Tensor) -> torch.Tensor:
         """Convert BeastTokenizer bins to VLM token IDs."""
-        return bin_ids + self.action_token_start_id
+        return self.vlm_vocab_size - 1 - bin_ids
 
     def _llm_ids_to_bins(self, llm_ids: torch.Tensor) -> torch.Tensor:
         """Convert VLM token IDs back to BeastTokenizer bins."""
-        bins = llm_ids - self.action_token_start_id
+        bins = self.vlm_vocab_size - 1 - llm_ids
         # Clamp to ensure validity during early training/sampling noise
         return torch.clamp(bins, 0, self.action_bins - 1)
+
+    def _preprocess_images(
+        self,
+        image_tensor: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        image_tensor = image_tensor.to(device=device, dtype=dtype)
+        image_tensor = F.interpolate(
+            image_tensor,
+            size=self.image_resize_hw,
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        if self.image_use_clip_normalization:
+            mean = torch.tensor(self.image_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
+            std = torch.tensor(self.image_std, device=device, dtype=dtype).view(1, -1, 1, 1)
+            image_tensor = (image_tensor - mean) / std
+        return image_tensor
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # 1. Encode Observations
@@ -323,9 +351,14 @@ class BeastFModel(nn.Module):
         if len(image_tensor.shape) == 4:
             image_tensor = image_tensor.unsqueeze(1)
         B, T, C, H, W = image_tensor.shape
+        image_tensor = self._preprocess_images(
+            image_tensor.reshape(-1, C, H, W),
+            device=device,
+            dtype=default_dtype,
+        )
         
         image_features = self.vlm._encode_image(
-            image_tensor.view(-1, C, H, W).to(device).to(default_dtype)
+            image_tensor
         )
         image_features = image_features.view(B, T * image_features.shape[1], -1)
 
@@ -333,38 +366,53 @@ class BeastFModel(nn.Module):
         if self.use_second_view and self.second_view_key in batch:
             img2 = batch[self.second_view_key]
             if len(img2.shape) == 4: img2 = img2.unsqueeze(1)
-            feat2 = self.vlm._encode_image(img2.view(-1, C, H, W).to(device).to(default_dtype))
+            feat2 = self.vlm._encode_image(
+                self._preprocess_images(
+                    img2.reshape(-1, C, H, W),
+                    device=device,
+                    dtype=default_dtype,
+                )
+            )
             feat2 = feat2.view(B, T * feat2.shape[1], -1)
             image_features = torch.cat([image_features, feat2], dim=1)
 
         # Text encoding
         txt = batch.get("task", self.task)
-        if not isinstance(txt, list):
-            if isinstance(txt, str):
-                txt = [txt] * B
-            else:
-                txt = [self.task] * B
-        
-        # Use prompt style
+        if isinstance(txt, tuple):
+            txt = list(txt)
+        elif isinstance(txt, str):
+            txt = [txt] * B
+        elif not isinstance(txt, list):
+            txt = [self.task] * B
+
         prompts = [
-            f"<od>{t}</od>" if self.vlm_prompt_style != "default" else t 
-            for t in txt
+            build_policy_prompt(
+                instruction=instruction,
+                robot_name=self.prompt_robot_name,
+                num_arms=self.prompt_num_arms,
+                action_space=self.prompt_action_space,
+                include_meta=self.prompt_include_meta,
+            )
+            for instruction in txt
         ]
+        if not self._logged_prompt_example and prompts:
+            logger.info("BEAST task example | raw: %s | prompt: %s", txt[0], prompts[0])
+            self._logged_prompt_example = True
         
         tokens = self.tokenizer(
-            prompts, return_tensors="pt", padding=True, truncation=True, max_length=128
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.text_max_length,
         ).to(device)
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
         
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        merged = torch.cat([task_prompt, image_features, text_embeds], dim=1)
-        
-        # Masks
-        vis_mask = torch.ones(image_features.shape[:2], device=device)
-        prompt_mask = torch.ones(B, 1, dtype=torch.long, device=device)
-        attn_mask = torch.cat([prompt_mask, vis_mask, tokens["attention_mask"]], dim=1)
+        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
+        attn_mask = torch.ones(merged.shape[:2], dtype=torch.long, device=device)
 
         features = self.vlm.get_encoder()(
             inputs_embeds=merged, attention_mask=attn_mask
