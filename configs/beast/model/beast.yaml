@@ -1,6 +1,10 @@
 _target_: policies.beastf.beastf_config.BeastVLAConfig
 
 use_amp: true
+normalization_mapping:
+  VISUAL: IDENTITY
+  STATE: MEAN_STD
+  ACTION: MEAN_STD
 
 vlm_path: "microsoft/Florence-2-base"
 vlm_model_name: "bert-base-uncased"

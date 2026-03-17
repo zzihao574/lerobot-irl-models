@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -16,14 +15,6 @@ class BeastVLAConfig(SmolVLAConfig):
     task: str = ""
     lang_modalities: list[str] = field(default_factory=lambda: ["language_instruction"])
     img_modalities: list[str] = field(default_factory=lambda: ["observation.image.centric_cam"])
-
-    normalization_mapping: dict[str, NormalizationMode] = field(
-        default_factory=lambda: {
-            "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
-        }
-    )
 
     vlm_path: str = "microsoft/Florence-2-base"
     vlm_model_name: str = "bert-base-uncased"
