@@ -13,13 +13,13 @@ from .beastf_config import BeastVLAConfig
 from .beast_tokenizer.beast import BeastTokenizer
 from .beastf_utils import build_policy_prompt, create_bidirectional_mask, token_prediction_accuracy
 
-from lerobot.processor.normalize_processor import (
-    NormalizerProcessorStep,
-    UnnormalizerProcessorStep,
-)
+from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
 from lerobot.utils.constants import ACTION
 
 logger = logging.getLogger(__name__)
+
+CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 class BeastVLAPolicy(PreTrainedPolicy):
@@ -33,32 +33,19 @@ class BeastVLAPolicy(PreTrainedPolicy):
         self,
         config: BeastVLAConfig,
         dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-        task: str = "",
         **kwargs,
     ):
         super().__init__(config)
-        if dataset_stats is None and hasattr(config, '_dataset_stats'):
-            dataset_stats = config._dataset_stats
-            
         config.validate_features()
         self.config = config
-        
-        self.normalize_inputs = NormalizerProcessorStep(
-            config.input_features, config.normalization_mapping, dataset_stats
-        )
-        self.normalize_targets = NormalizerProcessorStep(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
         self.unnormalize_outputs = UnnormalizerProcessorStep(
             config.output_features, config.normalization_mapping, dataset_stats
         )
-        
-        self.model = BeastFModel(config, task=task)
+
+        self.model = BeastFModel(config)
         self.model.reset()
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
         result = self.model.forward(batch)
         return result["loss"], result["loss_dict"]
 
@@ -91,7 +78,6 @@ class BeastVLAPolicy(PreTrainedPolicy):
         """
         if ACTION in batch:
             batch.pop(ACTION)
-        batch = self.normalize_inputs(batch)
         # Check if we need to predict a new action chunk
         if (
             self.model.rollout_step_counter % self.config.multistep == 0
@@ -122,10 +108,10 @@ class BeastVLAPolicy(PreTrainedPolicy):
 
 
 class BeastFModel(nn.Module):
-    def __init__(self, config: BeastVLAConfig, task: str = ""):
+    def __init__(self, config: BeastVLAConfig):
         super().__init__()
         self.config = config
-        self.task = task  # Store the task from config
+        self.task = config.task
         self.device = torch.device(
             config.device if hasattr(config, "device") and config.device
             else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,8 +155,8 @@ class BeastFModel(nn.Module):
         self.prompt_include_meta = config.prompt_include_meta
         self.image_resize_hw = tuple(config.image_resize_hw)
         self.image_use_clip_normalization = config.image_use_clip_normalization
-        self.image_mean = tuple(config.image_mean)
-        self.image_std = tuple(config.image_std)
+        self.image_mean = tuple(CLIP_IMAGE_MEAN)
+        self.image_std = tuple(CLIP_IMAGE_STD)
         self._logged_prompt_example = False
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):

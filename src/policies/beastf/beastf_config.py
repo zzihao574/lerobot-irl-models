@@ -13,6 +13,7 @@ class BeastVLAConfig(SmolVLAConfig):
     obs_modalities: str = "observation"
     goal_modalities: str = "task"
     target_modality: str = "action"
+    task: str = ""
     lang_modalities: list[str] = field(default_factory=lambda: ["language_instruction"])
     img_modalities: list[str] = field(default_factory=lambda: ["observation.image.centric_cam"])
 
@@ -37,9 +38,7 @@ class BeastVLAConfig(SmolVLAConfig):
     prompt_include_meta: bool = True
     image_resize_hw: tuple[int, int] = (224, 224)
     image_use_clip_normalization: bool = True
-    image_mean: tuple[float, float, float] = (0.48145466, 0.4578275, 0.40821073)
-    image_std: tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
-
+    
     action_dim: int = 8
     act_window_size: int = 30
     chunk_size: int = 30

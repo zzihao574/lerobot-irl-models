@@ -3,14 +3,13 @@ _target_: policies.beastf.beastf_config.BeastVLAConfig
 use_amp: true
 
 vlm_path: "microsoft/Florence-2-base"
+task: "fold the towel"
 prompt_robot_name: "Franka Panda"
 prompt_num_arms: 1
 prompt_action_space: "7 joint positions + 1 gripper width"
 prompt_include_meta: true
 image_resize_hw: [224, 224]
 image_use_clip_normalization: true
-image_mean: [0.48145466, 0.4578275, 0.40821073]
-image_std: [0.26862954, 0.26130258, 0.27577711]
 
 act_window_size: 30
 chunk_size: 30
