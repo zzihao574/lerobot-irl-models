@@ -132,6 +132,8 @@ class BeastFModel(nn.Module):
             config.freeze_florence,
             config.freeze_embeddings_only,
         )
+        hidden_size = self.vlm.get_input_embeddings().weight.shape[1]
+        self.state_proj = nn.Linear(config.action_dim, hidden_size)
         
         # --- Setup Tokenizer ---
         self._setup_action_tokenizer(config)
@@ -150,7 +152,7 @@ class BeastFModel(nn.Module):
     def _init_flags(self, config):
         self.use_second_view = config.use_second_view
         self.token_dropout = config.token_dropout
-        # self.use_proprio = config.use_proprio
+        self.use_proprio = config.use_proprio
         self.return_act_chunk = config.return_act_chunk
         self.second_view_key = config.second_view_key
         self.text_max_length = config.text_max_length
@@ -400,9 +402,22 @@ class BeastFModel(nn.Module):
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
         
+        #optional proprioperception embedding
+        if self.use_proprio:
+            proprio = batch.get("observation.state", None).to(device=device, dtype=default_dtype)
+            print("Proprio shape:", proprio.shape)
+            if proprio.ndim == 2:
+                proprio = proprio.unsqueeze(1)
+            proprio_embeds = self.state_proj(proprio)
+            
+
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
+        if self.use_proprio:
+            merged = torch.cat([image_features, task_prompt, text_embeds, proprio_embeds], dim=1)
+
+        else:
+            merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
         attn_mask = torch.ones(merged.shape[:2], dtype=torch.long, device=device)
 
         features = self.vlm.get_encoder()(
