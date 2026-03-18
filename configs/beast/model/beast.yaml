@@ -25,7 +25,7 @@ num_basis: 5
 num_dof: 8
 action_dim: 8
 gripper_dof: 1
-gripper_zero_order: false
+gripper_zero_order: true
 enforce_init_pos: true
 
 text_max_length: 77
@@ -33,4 +33,4 @@ tokenizer_max_length: ${.text_max_length}
 pad_language_to: "longest"
 use_second_view: true
 second_view_key: "observation.image.wrist_cam"
-use_proprio: true
+use_proprio: false
