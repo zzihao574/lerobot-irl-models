@@ -19,7 +19,7 @@ wandb:
 
 train:
   mode: "scratch"  # scratch | warmstart | resume
-  checkpoint_path: null
+  pretrained_model_path: null
   resume_config: null
   batch_size: 20
   num_workers: 4
