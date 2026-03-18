@@ -43,8 +43,23 @@ class BeastVLAPolicy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
+        self.action_mean = None
+        self.action_std = None
+        if dataset_stats is not None and ACTION in dataset_stats:
+            action_stats = dataset_stats[ACTION]
+            if "mean" in action_stats and "std" in action_stats:
+                self.action_mean = torch.as_tensor(action_stats["mean"], dtype=torch.float32)
+                self.action_std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
+
         self.model = BeastFModel(config)
         self.model.reset()
+
+    def _normalize_state_to_action_space(self, state_env: torch.Tensor) -> torch.Tensor:
+        if self.action_mean is None or self.action_std is None:
+            raise RuntimeError("Missing action mean/std in dataset stats; cannot build init_pos for first chunk.")
+        mean = self.action_mean.to(device=state_env.device, dtype=state_env.dtype)
+        std = self.action_std.to(device=state_env.device, dtype=state_env.dtype)
+        return (state_env - mean) / (std + 1e-8)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
         result = self.model.forward(batch)
@@ -55,8 +70,23 @@ class BeastVLAPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        init_pos = None
+        if (
+            self.model.pred_action_seq_norm is None
+            and "observation.state" in batch
+            and self.model.action_tokenizer.enforce_init_pos
+        ):
+            state_env = torch.as_tensor(
+                batch["observation.state"],
+                dtype=torch.float32,
+                device=self.model.device,
+            )
+            if state_env.ndim == 1:
+                state_env = state_env.unsqueeze(0)
+            init_pos = self._normalize_state_to_action_space(state_env)
+
         cond = self.model.encode_observations(batch)
-        norm_action_seq = self.model.sample_actions(None, cond, inference=True)
+        norm_action_seq = self.model.sample_actions(None, cond, inference=True, init_pos=init_pos)
         env_action_seq = self.unnormalize_outputs({ACTION: norm_action_seq})[ACTION]
         return norm_action_seq, env_action_seq
 
@@ -411,7 +441,7 @@ class BeastFModel(nn.Module):
         
         return {"features": features, "attention_mask": attn_mask}
 
-    def sample_actions(self, z, cond, inference=False):
+    def sample_actions(self, z, cond, inference=False, init_pos=None):
         features = cond["features"]
         mask = cond["attention_mask"]
         B = features.shape[0]
@@ -467,13 +497,15 @@ class BeastFModel(nn.Module):
         
         # Use init_pos relative reconstruction if needed (logic from original beast_florence)
         # beast.py decode_discrete accepts init_pos
-        init_pos = None
-        if self.pred_action_seq_norm is not None and self.action_tokenizer.enforce_init_pos:
-            # Use last action of previous chunk as start of next
-            init_pos = self.pred_action_seq_norm[:, -1, ...]
-            
-        actions = self.action_tokenizer.decode_discrete(pred_bins, init_pos=init_pos)
-        
+        decode_init_pos = init_pos
+        if (
+            decode_init_pos is None
+            and self.pred_action_seq_norm is not None
+            and self.action_tokenizer.enforce_init_pos
+        ):
+            decode_init_pos = self.pred_action_seq_norm[:, -1, ...]
+
+        actions = self.action_tokenizer.decode_discrete(pred_bins, init_pos=decode_init_pos)
         return actions
 
     def reset(self):
