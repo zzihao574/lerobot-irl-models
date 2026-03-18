@@ -134,7 +134,8 @@ class BeastFModel(nn.Module):
         )
         hidden_size = self.vlm.get_input_embeddings().weight.shape[1]
         self.state_proj = nn.Linear(config.action_dim, hidden_size)
-        
+        self.proprio_embedd = nn.Parameter(torch.randn(1, config.num_basis*config.num_dof, hidden_size, device=self.device), requires_grad=self.learnable_proprio_embedd)
+
         # --- Setup Tokenizer ---
         self._setup_action_tokenizer(config)
 
@@ -165,6 +166,8 @@ class BeastFModel(nn.Module):
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
         self.image_std = tuple(CLIP_IMAGE_STD)
         self._logged_prompt_example = False
+        self.learnable_proprio_embedd = config.learnable_proprio_embedd 
+        self.use_proprio = config.use_proprio
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
@@ -296,15 +299,28 @@ class BeastFModel(nn.Module):
         bidirectional_mask = create_bidirectional_mask(
             batch_size=B, seq_length=SeqLen, device=self.device
         )
-
+        
         # 5. Forward
-        decoder_outputs = self.vlm.get_decoder()(
-            input_ids=llm_input_ids,
-            encoder_hidden_states=features,
-            encoder_attention_mask=encoder_attn_mask,
-            attention_mask=bidirectional_mask,
-            use_cache=False,
-        )
+
+        if self.learnable_proprio_embedd:    
+            query_embeds = self.proprio_embedd.expand(B, -1, -1)
+            decoder_outputs = self.vlm.get_decoder()(
+                inputs_embeds=query_embeds,
+                encoder_hidden_states=features,
+                encoder_attention_mask=encoder_attn_mask,
+                attention_mask=bidirectional_mask,
+                use_cache=False,
+            )
+            
+        else:   
+
+            decoder_outputs = self.vlm.get_decoder()(
+                input_ids=llm_input_ids,
+                encoder_hidden_states=features,
+                encoder_attention_mask=encoder_attn_mask,
+                attention_mask=bidirectional_mask,
+                use_cache=False,
+            )
 
         lm_logits = self.vlm.language_model.get_output_embeddings()(decoder_outputs[0])
         lm_logits = lm_logits + self.vlm.language_model.final_logits_bias.to(lm_logits.device)
