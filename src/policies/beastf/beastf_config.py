@@ -52,6 +52,8 @@ class BeastVLAConfig(SmolVLAConfig):
     degree_p: int = 4
     action_bins: int = 256
     update_w_bound: bool = True
+    fixed_w_min: list[float] | None = None
+    fixed_w_max: list[float] | None = None
     text_max_length: int = 77
 
     return_act_chunk: bool = False

@@ -264,6 +264,8 @@ class BeastFModel(nn.Module):
             gripper_zero_order=config.gripper_zero_order,
             gripper_dof=config.gripper_dof,
             enforce_init_pos=config.enforce_init_pos,
+            w_min=config.fixed_w_min,
+            w_max=config.fixed_w_max,
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound

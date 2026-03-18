@@ -29,7 +29,7 @@ class BeastTokenizer(torch.nn.Module):
     
     def __init__(self, num_dof=1, num_basis=10, seq_len=50, vocab_size=256,
                  degree_p=4, gripper_zero_order=False, gripper_dof=1, init_cond_order=0, 
-                 end_cond_order=0, enforce_init_pos=True, device="cuda"):
+                 end_cond_order=0, enforce_init_pos=True, w_min=None, w_max=None, device="cuda"):
         super().__init__()
         
         # Store core parameters
@@ -55,7 +55,7 @@ class BeastTokenizer(torch.nn.Module):
         # Setup time grid and weight bounds
         # Working with normalized time [0, 1]
         self.times = tensor_linspace(0, 1.0, seq_len).to(device)
-        self._initialize_weight_bounds()
+        self._initialize_weight_bounds(w_min=w_min, w_max=w_max)
         
         self.to(self.device)
     
@@ -76,11 +76,19 @@ class BeastTokenizer(torch.nn.Module):
         })
         return SplineFactory.init_splines(**config)
     
-    def _initialize_weight_bounds(self):
+    def _initialize_weight_bounds(self, w_min=None, w_max=None):
         """Initialize weight bounds for normalization."""
         total_params = self.num_dof * self.num_basis
-        self.register_buffer("w_min", -1.0 * torch.ones(total_params))
-        self.register_buffer("w_max", 1.0 * torch.ones(total_params))
+        if w_min is None:
+            w_min = -1.0 * torch.ones(total_params)
+        else:
+            w_min = torch.as_tensor(w_min, dtype=torch.float32)
+        if w_max is None:
+            w_max = 1.0 * torch.ones(total_params)
+        else:
+            w_max = torch.as_tensor(w_max, dtype=torch.float32)
+        self.register_buffer("w_min", w_min.clone())
+        self.register_buffer("w_max", w_max.clone())
     
     def _get_repeated_times(self, batch_size):
         """Get time tensor repeated for batch processing."""
