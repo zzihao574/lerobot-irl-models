@@ -43,7 +43,6 @@ class BeastVLAConfig(SmolVLAConfig):
     use_second_view: bool = True
     second_view_key: str = "observation.image.wrist_cam"
     use_proprio: bool = False
-    learnable_proprio_embedd: bool = False
 
     num_dof: int = 8
     gripper_dof: int = 1

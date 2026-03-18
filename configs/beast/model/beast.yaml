@@ -33,3 +33,4 @@ tokenizer_max_length: ${.text_max_length}
 pad_language_to: "longest"
 use_second_view: true
 second_view_key: "observation.image.wrist_cam"
+use_proprio: true

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+OBSERVATION_STATE = "observation.state"
 
 
 class BeastVLAPolicy(PreTrainedPolicy):
@@ -51,6 +52,14 @@ class BeastVLAPolicy(PreTrainedPolicy):
                 self.action_mean = torch.as_tensor(action_stats["mean"], dtype=torch.float32)
                 self.action_std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
 
+        self.state_mean = None
+        self.state_std = None
+        if dataset_stats is not None and OBSERVATION_STATE in dataset_stats:
+            state_stats = dataset_stats[OBSERVATION_STATE]
+            if "mean" in state_stats and "std" in state_stats:
+                self.state_mean = torch.as_tensor(state_stats["mean"], dtype=torch.float32)
+                self.state_std = torch.as_tensor(state_stats["std"], dtype=torch.float32)
+
         self.model = BeastFModel(config)
         self.model.reset()
 
@@ -60,6 +69,13 @@ class BeastVLAPolicy(PreTrainedPolicy):
         mean = self.action_mean.to(device=state_env.device, dtype=state_env.dtype)
         std = self.action_std.to(device=state_env.device, dtype=state_env.dtype)
         return (state_env - mean) / (std + 1e-8)
+
+    def _unnormalize_observation_state(self, state_obs: torch.Tensor) -> torch.Tensor:
+        if self.state_mean is None or self.state_std is None:
+            return state_obs
+        mean = self.state_mean.to(device=state_obs.device, dtype=state_obs.dtype)
+        std = self.state_std.to(device=state_obs.device, dtype=state_obs.dtype)
+        return state_obs * (std + 1e-8) + mean
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
         result = self.model.forward(batch)
@@ -76,13 +92,14 @@ class BeastVLAPolicy(PreTrainedPolicy):
             and "observation.state" in batch
             and self.model.action_tokenizer.enforce_init_pos
         ):
-            state_env = torch.as_tensor(
+            state_obs = torch.as_tensor(
                 batch["observation.state"],
                 dtype=torch.float32,
                 device=self.model.device,
             )
-            if state_env.ndim == 1:
-                state_env = state_env.unsqueeze(0)
+            if state_obs.ndim == 1:
+                state_obs = state_obs.unsqueeze(0)
+            state_env = self._unnormalize_observation_state(state_obs)
             init_pos = self._normalize_state_to_action_space(state_env)
 
         cond = self.model.encode_observations(batch)
@@ -163,8 +180,11 @@ class BeastFModel(nn.Module):
             config.freeze_embeddings_only,
         )
         hidden_size = self.vlm.get_input_embeddings().weight.shape[1]
-        self.state_proj = nn.Linear(config.action_dim, hidden_size)
-        self.proprio_embedd = nn.Parameter(torch.randn(1, config.num_basis*config.num_dof, hidden_size, device=self.device), requires_grad=self.learnable_proprio_embedd)
+        self.state_proj = nn.Sequential(
+            nn.Linear(config.action_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
 
         # --- Setup Tokenizer ---
         self._setup_action_tokenizer(config)
@@ -172,6 +192,7 @@ class BeastFModel(nn.Module):
         self.rollout_step_counter = 0
         self.pred_action_seq_norm = None
         self.pred_action_seq_env = None
+        self.debug_print_control_points = False
         self.ensure_device_consistency()
 
     def _init_modalities(self, config):
@@ -196,8 +217,6 @@ class BeastFModel(nn.Module):
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
         self.image_std = tuple(CLIP_IMAGE_STD)
         self._logged_prompt_example = False
-        self.learnable_proprio_embedd = config.learnable_proprio_embedd 
-        self.use_proprio = config.use_proprio
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
@@ -296,11 +315,50 @@ class BeastFModel(nn.Module):
             image_tensor = (image_tensor - mean) / std
         return image_tensor
 
+    def _build_decoder_inputs(
+        self,
+        batch_size: int,
+        proprio: torch.Tensor | None,
+    ) -> Dict[str, torch.Tensor]:
+        seq_len_tokens = self.action_tokenizer.num_dof * self.action_tokenizer.num_basis
+        filler_bin = torch.full(
+            (batch_size, seq_len_tokens),
+            self.action_bins // 2,
+            dtype=torch.long,
+            device=self.device,
+        )
+        llm_input_ids = self._bins_to_llm_ids(filler_bin)
+        decoder_inputs = self.vlm.get_input_embeddings()(llm_input_ids)
+
+        if self.use_proprio and proprio is not None:
+            proprio = proprio.to(device=self.device, dtype=decoder_inputs.dtype)
+            if proprio.ndim == 3:
+                proprio = proprio[:, 0, :]
+            elif proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+
+            proprio_token = self.state_proj(proprio).unsqueeze(1)
+            proprio_token = F.layer_norm(proprio_token, (proprio_token.shape[-1],))
+            proprio_token = proprio_token / proprio_token.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            proprio_token = proprio_token * decoder_inputs.detach().norm(dim=-1, keepdim=True).mean(dim=1, keepdim=True)
+            decoder_inputs = torch.cat([proprio_token, decoder_inputs], dim=1)
+
+        attention_mask = create_bidirectional_mask(
+            batch_size=batch_size,
+            seq_length=decoder_inputs.shape[1],
+            device=self.device,
+        )
+        return {
+            "inputs_embeds": decoder_inputs,
+            "attention_mask": attention_mask,
+        }
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # 1. Encode Observations
         encoded = self.encode_observations(batch)
-        features = encoded['features']
-        encoder_attn_mask = encoded['attention_mask']
+        features = encoded["features"]
+        encoder_attn_mask = encoded["attention_mask"]
+        proprio = encoded.get("proprio")
 
         # 2. Prepare Targets
         actions = batch[self.target_modality]
@@ -319,53 +377,33 @@ class BeastFModel(nn.Module):
         llm_label_ids = self._bins_to_llm_ids(action_bins)
 
         # 3. Prepare Decoder Input
-        # Use a filler token (e.g., middle of action range) as prompt for decoder
-        # This matches the "empty action token" logic from original code
         B, SeqLen = llm_label_ids.shape
-        filler_bin = torch.full((B, SeqLen), self.action_bins // 2, dtype=torch.long, device=self.device)
-        llm_input_ids = self._bins_to_llm_ids(filler_bin)
-
-        # 4. Bidirectional Mask
-        bidirectional_mask = create_bidirectional_mask(
-            batch_size=B, seq_length=SeqLen, device=self.device
-        )
+        decoder_inputs = self._build_decoder_inputs(B, proprio=proprio)
         
-        # 5. Forward
-
-        if self.learnable_proprio_embedd:    
-            query_embeds = self.proprio_embedd.expand(B, -1, -1)
-            decoder_outputs = self.vlm.get_decoder()(
-                inputs_embeds=query_embeds,
-                encoder_hidden_states=features,
-                encoder_attention_mask=encoder_attn_mask,
-                attention_mask=bidirectional_mask,
-                use_cache=False,
-            )
-            
-        else:   
-
-            decoder_outputs = self.vlm.get_decoder()(
-                input_ids=llm_input_ids,
-                encoder_hidden_states=features,
-                encoder_attention_mask=encoder_attn_mask,
-                attention_mask=bidirectional_mask,
-                use_cache=False,
-            )
+        # 4. Forward
+        decoder_outputs = self.vlm.get_decoder()(
+            inputs_embeds=decoder_inputs["inputs_embeds"],
+            encoder_hidden_states=features,
+            encoder_attention_mask=encoder_attn_mask,
+            attention_mask=decoder_inputs["attention_mask"],
+            use_cache=False,
+        )
 
         lm_logits = self.vlm.language_model.get_output_embeddings()(decoder_outputs[0])
         lm_logits = lm_logits + self.vlm.language_model.final_logits_bias.to(lm_logits.device)
+        action_logits = lm_logits[:, -SeqLen:, :]
 
-        # 6. Loss
+        # 5. Loss
         loss_fct = nn.CrossEntropyLoss()
         # View: [Batch*Seq, VocabSize] vs [Batch*Seq]
         masked_lm_loss = loss_fct(
-            lm_logits.view(-1, self.vlm.config.vocab_size),
-            llm_label_ids.view(-1),
+            action_logits.reshape(-1, self.vlm.config.vocab_size),
+            llm_label_ids.reshape(-1),
         )
 
-        # 7. Metrics (Optional)
+        # 6. Metrics (Optional)
         with torch.no_grad():
-            pred_ids = torch.argmax(lm_logits, dim=-1)
+            pred_ids = torch.argmax(action_logits, dim=-1)
             pred_bins = self._llm_ids_to_bins(pred_ids)
             # Decode: Discrete Bins -> Continuous Actions
             recon_actions = self.action_tokenizer.decode_discrete(pred_bins)
@@ -447,59 +485,48 @@ class BeastFModel(nn.Module):
         ).to(device)
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
-        
-        #optional proprioperception embedding
-        if self.use_proprio:
-            proprio = batch.get("observation.state", None).to(device=device, dtype=default_dtype)
-            print("Proprio shape:", proprio.shape)
-            if proprio.ndim == 2:
-                proprio = proprio.unsqueeze(1)
-            proprio_embeds = self.state_proj(proprio)
-            
 
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        if self.use_proprio:
-            merged = torch.cat([image_features, task_prompt, text_embeds, proprio_embeds], dim=1)
-
-        else:
-            merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
+        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
         attn_mask = torch.ones(merged.shape[:2], dtype=torch.long, device=device)
 
         features = self.vlm.get_encoder()(
             inputs_embeds=merged, attention_mask=attn_mask
         ).last_hidden_state
         
-        return {"features": features, "attention_mask": attn_mask}
+        return {
+            "features": features,
+            "attention_mask": attn_mask,
+            "proprio": batch.get(OBSERVATION_STATE),
+        }
 
     def sample_actions(self, z, cond, inference=False, init_pos=None):
         features = cond["features"]
         mask = cond["attention_mask"]
+        proprio = cond.get("proprio")
         B = features.shape[0]
         
         # 1. Construct Filler Input
         # We need (NumDOF * NumBasis) tokens
         seq_len_tokens = self.action_tokenizer.num_dof * self.action_tokenizer.num_basis
-        filler_bin = torch.full((B, seq_len_tokens), self.action_bins // 2, dtype=torch.long, device=self.device)
-        llm_input_ids = self._bins_to_llm_ids(filler_bin)
+        decoder_inputs = self._build_decoder_inputs(B, proprio=proprio)
         
-        # 2. Bidirectional Mask
-        bidirectional_mask = create_bidirectional_mask(B, seq_len_tokens, self.device)
-        
-        # 3. Decode
+        # 2. Decode
         decoder_outputs = self.vlm.get_decoder()(
-            input_ids=llm_input_ids,
+            inputs_embeds=decoder_inputs["inputs_embeds"],
             encoder_hidden_states=features,
             encoder_attention_mask=mask,
-            attention_mask=bidirectional_mask,
+            attention_mask=decoder_inputs["attention_mask"],
             use_cache=False,
         )
         
         lm_logits = self.vlm.language_model.get_output_embeddings()(decoder_outputs[0])
         lm_logits = lm_logits + self.vlm.language_model.final_logits_bias.to(lm_logits.device)
+        action_logits = lm_logits[:, -seq_len_tokens:, :]
         
-        # 4. Reconstruct
-        pred_ids = torch.argmax(lm_logits, dim=-1)
+        # 3. Reconstruct
+        pred_ids = torch.argmax(action_logits, dim=-1)
         pred_bins = self._llm_ids_to_bins(pred_ids)
         
         #(optional) print continuous control point 
@@ -522,9 +549,10 @@ class BeastFModel(nn.Module):
             t=self.action_tokenizer.num_basis,
         )
 
-        print("=== New BEAST chunk ===")
-        print("control_points[0] shape:", tuple(control_points[0].shape))
-        print(control_points[0].detach().cpu())
+        if self.debug_print_control_points:
+            logger.info("=== New BEAST chunk ===")
+            logger.info("control_points[0] shape: %s", tuple(control_points[0].shape))
+            logger.info("%s", control_points[0].detach().cpu())
         
         # Use init_pos relative reconstruction if needed (logic from original beast_florence)
         # beast.py decode_discrete accepts init_pos
