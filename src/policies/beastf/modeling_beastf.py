@@ -8,6 +8,7 @@ import einops
 from lerobot.policies.pretrained import PreTrainedPolicy
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 
+from .beast_tokenizer.utils import discrete_to_continuous
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
 from .beast_tokenizer.beast import BeastTokenizer
@@ -439,6 +440,30 @@ class BeastFModel(nn.Module):
         # 4. Reconstruct
         pred_ids = torch.argmax(lm_logits, dim=-1)
         pred_bins = self._llm_ids_to_bins(pred_ids)
+        
+        #(optional) print continuous control point 
+        control_points_flat = discrete_to_continuous(
+            einops.rearrange(
+                pred_bins,
+                "b (t d) -> b (d t)",
+                t=self.action_tokenizer.num_basis,
+                d=self.action_tokenizer.num_dof,
+            ),
+            min_val=self.action_tokenizer.w_min,
+            max_val=self.action_tokenizer.w_max,
+            num_bins=self.action_bins,
+        )
+
+        control_points = einops.rearrange(
+            control_points_flat,
+            "b (d t) -> b t d",
+            d=self.action_tokenizer.num_dof,
+            t=self.action_tokenizer.num_basis,
+        )
+
+        print("=== New BEAST chunk ===")
+        print("control_points[0] shape:", tuple(control_points[0].shape))
+        print(control_points[0].detach().cpu())
         
         # Use init_pos relative reconstruction if needed (logic from original beast_florence)
         # beast.py decode_discrete accepts init_pos
