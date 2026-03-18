@@ -42,6 +42,8 @@ class BeastVLAConfig(SmolVLAConfig):
 
     use_second_view: bool = True
     second_view_key: str = "observation.image.wrist_cam"
+    use_proprio: bool = False
+    learnable_proprio_embedd: bool = False
 
     num_dof: int = 8
     gripper_dof: int = 1
@@ -87,3 +89,10 @@ class BeastVLAConfig(SmolVLAConfig):
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
         )
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        cfg = PreTrainedConfig.from_pretrained(pretrained_name_or_path, **kwargs)
+        if not isinstance(cfg, cls):
+            raise TypeError(f"Expected {cls.__name__} from checkpoint, got {type(cfg).__name__}")
+        return cfg

@@ -162,7 +162,10 @@ class BeastFModel(nn.Module):
             config.freeze_florence,
             config.freeze_embeddings_only,
         )
-        
+        hidden_size = self.vlm.get_input_embeddings().weight.shape[1]
+        self.state_proj = nn.Linear(config.action_dim, hidden_size)
+        self.proprio_embedd = nn.Parameter(torch.randn(1, config.num_basis*config.num_dof, hidden_size, device=self.device), requires_grad=self.learnable_proprio_embedd)
+
         # --- Setup Tokenizer ---
         self._setup_action_tokenizer(config)
 
@@ -180,7 +183,7 @@ class BeastFModel(nn.Module):
     def _init_flags(self, config):
         self.use_second_view = config.use_second_view
         self.token_dropout = config.token_dropout
-        # self.use_proprio = config.use_proprio
+        self.use_proprio = config.use_proprio
         self.return_act_chunk = config.return_act_chunk
         self.second_view_key = config.second_view_key
         self.text_max_length = config.text_max_length
@@ -193,6 +196,8 @@ class BeastFModel(nn.Module):
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
         self.image_std = tuple(CLIP_IMAGE_STD)
         self._logged_prompt_example = False
+        self.learnable_proprio_embedd = config.learnable_proprio_embedd 
+        self.use_proprio = config.use_proprio
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
@@ -324,15 +329,28 @@ class BeastFModel(nn.Module):
         bidirectional_mask = create_bidirectional_mask(
             batch_size=B, seq_length=SeqLen, device=self.device
         )
-
+        
         # 5. Forward
-        decoder_outputs = self.vlm.get_decoder()(
-            input_ids=llm_input_ids,
-            encoder_hidden_states=features,
-            encoder_attention_mask=encoder_attn_mask,
-            attention_mask=bidirectional_mask,
-            use_cache=False,
-        )
+
+        if self.learnable_proprio_embedd:    
+            query_embeds = self.proprio_embedd.expand(B, -1, -1)
+            decoder_outputs = self.vlm.get_decoder()(
+                inputs_embeds=query_embeds,
+                encoder_hidden_states=features,
+                encoder_attention_mask=encoder_attn_mask,
+                attention_mask=bidirectional_mask,
+                use_cache=False,
+            )
+            
+        else:   
+
+            decoder_outputs = self.vlm.get_decoder()(
+                input_ids=llm_input_ids,
+                encoder_hidden_states=features,
+                encoder_attention_mask=encoder_attn_mask,
+                attention_mask=bidirectional_mask,
+                use_cache=False,
+            )
 
         lm_logits = self.vlm.language_model.get_output_embeddings()(decoder_outputs[0])
         lm_logits = lm_logits + self.vlm.language_model.final_logits_bias.to(lm_logits.device)
@@ -430,9 +448,22 @@ class BeastFModel(nn.Module):
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
         
+        #optional proprioperception embedding
+        if self.use_proprio:
+            proprio = batch.get("observation.state", None).to(device=device, dtype=default_dtype)
+            print("Proprio shape:", proprio.shape)
+            if proprio.ndim == 2:
+                proprio = proprio.unsqueeze(1)
+            proprio_embeds = self.state_proj(proprio)
+            
+
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
+        if self.use_proprio:
+            merged = torch.cat([image_features, task_prompt, text_embeds, proprio_embeds], dim=1)
+
+        else:
+            merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
         attn_mask = torch.ones(merged.shape[:2], dtype=torch.long, device=device)
 
         features = self.vlm.get_encoder()(
