@@ -9,7 +9,7 @@ normalization_mapping:
 vlm_path: "microsoft/Florence-2-base"
 vlm_model_name: "bert-base-uncased"
 freeze_florence: false
-freeze_vision_tower: true
+freeze_vision_tower: false
 freeze_embeddings_only: false
 task: "fold the towel"
 prompt_robot_name: "Franka Panda"
@@ -40,8 +40,7 @@ gripper_dof: 1
 gripper_zero_order: False
 update_w_bound: true
 
-text_max_length: 77
-tokenizer_max_length: ${.text_max_length}
+tokenizer_max_length: 128
 pad_language_to: "longest"
 use_second_view: true
 second_view_key: "observation.image.wrist_cam"

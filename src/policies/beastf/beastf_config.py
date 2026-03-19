@@ -43,7 +43,7 @@ class BeastVLAConfig(SmolVLAConfig):
 
     vlm_path: str = "microsoft/Florence-2-base"
     vlm_model_name: str = "bert-base-uncased"
-    tokenizer_max_length: int = 77
+    tokenizer_max_length: int = 128
     pad_language_to: str = "longest"
     freeze_florence: bool = False
     freeze_vision_tower: bool = False
@@ -77,7 +77,6 @@ class BeastVLAConfig(SmolVLAConfig):
     degree_p: int = 4
     action_bins: int = 256
     update_w_bound: bool = True
-    text_max_length: int = 77
 
     return_act_chunk: bool = False
     use_action_scale: bool = False
@@ -96,7 +95,6 @@ class BeastVLAConfig(SmolVLAConfig):
         self.optimizer_betas = tuple(self.optimizer_betas)
         self.chunk_size = self.act_window_size
         self.n_action_steps = self.multistep
-        self.tokenizer_max_length = self.text_max_length
         self.pad_language_to = "longest"
         super().__post_init__()
 

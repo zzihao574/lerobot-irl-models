@@ -13,7 +13,7 @@ from .beast_tokenizer.utils import discrete_to_continuous
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
 from .beast_tokenizer.beast import BeastTokenizer
-from .beastf_utils import build_policy_prompt, create_bidirectional_mask, token_prediction_accuracy
+from .beastf_utils import create_bidirectional_mask, token_prediction_accuracy
 
 from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
 from lerobot.utils.constants import ACTION
@@ -228,7 +228,6 @@ class BeastFModel(nn.Module):
         self.use_proprio = config.use_proprio
         self.return_act_chunk = config.return_act_chunk
         self.second_view_key = config.second_view_key
-        self.text_max_length = config.text_max_length
         self.prompt_robot_name = config.prompt_robot_name
         self.prompt_num_arms = config.prompt_num_arms
         self.prompt_action_space = config.prompt_action_space
@@ -256,11 +255,11 @@ class BeastFModel(nn.Module):
         
         if freeze_florence:
             for param in self.vlm.parameters(): param.requires_grad = False
-        elif freeze_embed:
-            for param in self.vlm.get_input_embeddings().parameters(): param.requires_grad = False
-
-        if not freeze_vision:
-            for param in self.vlm.vision_tower.parameters(): param.requires_grad = True
+        else:
+            if freeze_embed:
+                for param in self.vlm.get_input_embeddings().parameters(): param.requires_grad = False
+            if freeze_vision:
+                for param in self.vlm.vision_tower.parameters(): param.requires_grad = False
 
         self.processor = AutoProcessor.from_pretrained(vlm_path, trust_remote_code=True)
         self.tokenizer = self.processor.tokenizer
@@ -476,24 +475,10 @@ class BeastFModel(nn.Module):
             image_features = torch.cat([image_features, feat2], dim=1)
 
         # Text encoding
-        txt = batch.get("task", self.task)
-        if isinstance(txt, tuple):
-            txt = list(txt)
-        elif isinstance(txt, str):
-            txt = [txt] * B
-        elif not isinstance(txt, list):
-            txt = [self.task] * B
-
-        prompts = [
-            build_policy_prompt(
-                instruction=instruction,
-                robot_name=self.prompt_robot_name,
-                num_arms=self.prompt_num_arms,
-                action_space=self.prompt_action_space,
-                include_meta=self.prompt_include_meta,
-            )
-            for instruction in txt
-        ]
+        txt = batch.get("text", batch.get("task", [""] * B))
+        if not isinstance(txt, list):
+            txt = [txt] * B if isinstance(txt, str) else [""] * B
+        prompts = txt
         if not self._logged_prompt_example and prompts:
             logger.info("BEAST task example | raw: %s | prompt: %s", txt[0], prompts[0])
             self._logged_prompt_example = True
@@ -503,15 +488,17 @@ class BeastFModel(nn.Module):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.text_max_length,
+            max_length=128,
         ).to(device)
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
 
         # Combine
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
-        attn_mask = torch.ones(merged.shape[:2], dtype=torch.long, device=device)
+        merged = torch.cat([task_prompt, image_features, text_embeds], dim=1)
+        vis_mask = torch.ones(image_features.shape[:2], device=device)
+        prompt_mask = torch.ones(B, 1, dtype=torch.long, device=device)
+        attn_mask = torch.cat([prompt_mask, vis_mask, tokens["attention_mask"]], dim=1)
 
         features = self.vlm.get_encoder()(
             inputs_embeds=merged, attention_mask=attn_mask
