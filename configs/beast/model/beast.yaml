@@ -1,25 +1,25 @@
 _target_: policies.beastf.beastf_config.BeastVLAConfig
 
-use_amp: true
+use_amp: false
 normalization_mapping:
-  VISUAL: MEAN_STD
+  VISUAL: IDENTITY
   STATE: MEAN_STD
-  ACTION: IDENTITY
+  ACTION: MEAN_STD
 
 vlm_path: "microsoft/Florence-2-base"
 vlm_model_name: "bert-base-uncased"
 freeze_florence: false
-freeze_vision_tower: false
+freeze_vision_tower: true
 freeze_embeddings_only: false
 task: "fold the towel"
 prompt_robot_name: "Franka Panda"
 prompt_num_arms: 1
 prompt_action_space: "7 joint positions + 1 gripper width"
 prompt_include_meta: true
-image_resize_hw: [224, 224]
-image_use_clip_normalization: true
+image_resize_hw: null
+image_use_clip_normalization: false
 
-optimizer_lr: 1e-5
+optimizer_lr: 2e-5
 optimizer_betas: [0.9, 0.999]
 optimizer_eps: 1e-8
 optimizer_weight_decay: 1e-4
@@ -33,11 +33,11 @@ multistep: 16
 chunk_size: 16
 n_action_steps: 16
 
-num_basis: 6
+num_basis: 5
 num_dof: 8
 action_dim: 8
 gripper_dof: 1
-gripper_zero_order: true
+gripper_zero_order: False
 update_w_bound: true
 
 text_max_length: 77

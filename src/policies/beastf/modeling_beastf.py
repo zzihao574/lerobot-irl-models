@@ -233,7 +233,7 @@ class BeastFModel(nn.Module):
         self.prompt_num_arms = config.prompt_num_arms
         self.prompt_action_space = config.prompt_action_space
         self.prompt_include_meta = config.prompt_include_meta
-        self.image_resize_hw = tuple(config.image_resize_hw)
+        self.image_resize_hw = None if config.image_resize_hw is None else tuple(config.image_resize_hw)
         self.image_use_clip_normalization = config.image_use_clip_normalization
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
         self.image_std = tuple(CLIP_IMAGE_STD)
@@ -323,13 +323,14 @@ class BeastFModel(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         image_tensor = image_tensor.to(device=device, dtype=dtype)
-        image_tensor = F.interpolate(
-            image_tensor,
-            size=self.image_resize_hw,
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        )
+        if self.image_resize_hw is not None:
+            image_tensor = F.interpolate(
+                image_tensor,
+                size=self.image_resize_hw,
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
         if self.image_use_clip_normalization:
             mean = torch.tensor(self.image_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
             std = torch.tensor(self.image_std, device=device, dtype=dtype).view(1, -1, 1, 1)

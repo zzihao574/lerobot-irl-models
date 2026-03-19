@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -15,6 +16,30 @@ class BeastVLAConfig(SmolVLAConfig):
     task: str = ""
     lang_modalities: list[str] = field(default_factory=lambda: ["language_instruction"])
     img_modalities: list[str] = field(default_factory=lambda: ["observation.image.centric_cam"])
+    input_features: dict = field(
+        default_factory=lambda: {
+            "observation.image.centric_cam": PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(3, 512, 512),
+            ),
+            "observation.image.wrist_cam": PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(3, 512, 512),
+            ),
+            "observation.state": PolicyFeature(
+                type=FeatureType.STATE,
+                shape=(8,),
+            ),
+        }
+    )
+    output_features: dict = field(
+        default_factory=lambda: {
+            "action": PolicyFeature(
+                type=FeatureType.ACTION,
+                shape=(8,),
+            ),
+        }
+    )
 
     vlm_path: str = "microsoft/Florence-2-base"
     vlm_model_name: str = "bert-base-uncased"
@@ -30,7 +55,7 @@ class BeastVLAConfig(SmolVLAConfig):
     prompt_num_arms: int = 1
     prompt_action_space: str = "7 joint positions + 1 gripper width"
     prompt_include_meta: bool = True
-    image_resize_hw: tuple[int, int] = (224, 224)
+    image_resize_hw: tuple[int, int] | None = (224, 224)
     image_use_clip_normalization: bool = True
     
     action_dim: int = 8
