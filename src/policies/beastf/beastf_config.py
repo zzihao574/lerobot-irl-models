@@ -52,8 +52,6 @@ class BeastVLAConfig(SmolVLAConfig):
     degree_p: int = 4
     action_bins: int = 256
     update_w_bound: bool = True
-    fixed_w_min: list[float] | None = None
-    fixed_w_max: list[float] | None = None
     text_max_length: int = 77
 
     return_act_chunk: bool = False
@@ -64,11 +62,13 @@ class BeastVLAConfig(SmolVLAConfig):
     optimizer_betas: tuple[float, float] = (0.9, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-4
+    optimizer_grad_clip_norm: float = 10.0
     scheduler_warmup_steps: int = 1000
     scheduler_decay_steps: int = 400_000
     scheduler_decay_lr: float = 1e-5
 
     def __post_init__(self) -> None:
+        self.optimizer_betas = tuple(self.optimizer_betas)
         self.chunk_size = self.act_window_size
         self.n_action_steps = self.multistep
         self.tokenizer_max_length = self.text_max_length
@@ -81,6 +81,7 @@ class BeastVLAConfig(SmolVLAConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
     def get_scheduler_preset(self):

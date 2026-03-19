@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.policies.pretrained import PreTrainedPolicy
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 
@@ -63,7 +64,16 @@ class BeastVLAPolicy(PreTrainedPolicy):
         self.model = BeastFModel(config)
         self.model.reset()
 
+    def _get_norm_mode(self, feature_type: FeatureType) -> str:
+        mapping = self.config.normalization_mapping or {}
+        mode = mapping.get(feature_type)
+        if mode is None:
+            mode = mapping.get(feature_type.value, NormalizationMode.IDENTITY)
+        return getattr(mode, "value", str(mode))
+
     def _normalize_state_to_action_space(self, state_env: torch.Tensor) -> torch.Tensor:
+        if self._get_norm_mode(FeatureType.ACTION) == NormalizationMode.IDENTITY.value:
+            return state_env
         if self.action_mean is None or self.action_std is None:
             raise RuntimeError("Missing action mean/std in dataset stats; cannot build init_pos for first chunk.")
         mean = self.action_mean.to(device=state_env.device, dtype=state_env.dtype)
@@ -71,14 +81,25 @@ class BeastVLAPolicy(PreTrainedPolicy):
         return (state_env - mean) / (std + 1e-8)
 
     def _unnormalize_observation_state(self, state_obs: torch.Tensor) -> torch.Tensor:
+        if self._get_norm_mode(FeatureType.STATE) == NormalizationMode.IDENTITY.value:
+            return state_obs
         if self.state_mean is None or self.state_std is None:
             return state_obs
         mean = self.state_mean.to(device=state_obs.device, dtype=state_obs.dtype)
         std = self.state_std.to(device=state_obs.device, dtype=state_obs.dtype)
         return state_obs * (std + 1e-8) + mean
 
+    def _normalize_action_targets(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.action_mean is None or self.action_std is None:
+            raise RuntimeError("Missing action mean/std in dataset stats; cannot apply extra action normalization.")
+        mean = self.action_mean.to(device=actions.device, dtype=actions.dtype)
+        std = self.action_std.to(device=actions.device, dtype=actions.dtype)
+        return (actions - mean) / (std + 1e-8)
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        result = self.model.forward(batch)
+        train_batch = dict(batch)
+        train_batch[ACTION] = self._normalize_action_targets(train_batch[ACTION])
+        result = self.model.forward(train_batch)
         return result["loss"], result["loss_dict"]
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -264,8 +285,6 @@ class BeastFModel(nn.Module):
             gripper_zero_order=config.gripper_zero_order,
             gripper_dof=config.gripper_dof,
             enforce_init_pos=config.enforce_init_pos,
-            w_min=config.fixed_w_min,
-            w_max=config.fixed_w_max,
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound
