@@ -211,6 +211,7 @@ class BeastFModel(nn.Module):
         self.prompt_num_arms = config.prompt_num_arms
         self.prompt_action_space = config.prompt_action_space
         self.prompt_include_meta = config.prompt_include_meta
+        self.default_task = config.task
         self.image_resize_hw = None if config.image_resize_hw is None else tuple(config.image_resize_hw)
         self.image_use_clip_normalization = config.image_use_clip_normalization
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
@@ -267,6 +268,15 @@ class BeastFModel(nn.Module):
         self.update_w_bound = config.update_w_bound
         self.action_token_start_id = self.tokenizer.convert_tokens_to_ids("<loc_0>")
         logger.info(f"Action tokens start at ID: {self.action_token_start_id}")
+
+    def _build_prompt(self, instruction: str) -> str:
+        """Build structured prompt from task instruction and robot metadata (aligned with beast_calvin)."""
+        meta = (
+            f"Agent Type: {self.prompt_num_arms}-arm {self.prompt_robot_name}, "
+            f"Action Space: {self.prompt_action_space}, "
+        )
+        prompt = f"{meta if self.prompt_include_meta else ''}Task Instruction: {instruction}"
+        return " ".join(prompt.split())
 
     def _create_prompt_embed(self, prompt_text: str) -> nn.Parameter:
         self.tokenizer.add_special_tokens({"additional_special_tokens": [prompt_text]})
@@ -465,11 +475,16 @@ class BeastFModel(nn.Module):
             feat2 = feat2.view(B, T * feat2.shape[1], -1)
             image_features = torch.cat([image_features, feat2], dim=1)
 
-        # Text encoding
-        txt = batch.get("text", batch.get("task", [""] * B))
-        if not isinstance(txt, list):
-            txt = [txt] * B if isinstance(txt, str) else [""] * B
-        prompts = txt
+        # Text encoding: get raw task, fall back to config.task
+        txt = batch.get("text", batch.get("task"))
+        if txt is None:
+            txt = [self.default_task] * B
+        elif isinstance(txt, str):
+            txt = [txt] * B
+        elif not isinstance(txt, list):
+            txt = [self.default_task] * B
+        # Wrap with robot metadata (aligned with beast_calvin prompt style)
+        prompts = [self._build_prompt(t) for t in txt]
         if not self._logged_prompt_example and prompts:
             logger.info("BEAST task example | raw: %s | prompt: %s", txt[0], prompts[0])
             self._logged_prompt_example = True
@@ -484,12 +499,11 @@ class BeastFModel(nn.Module):
         
         text_embeds = self.vlm.get_input_embeddings()(tokens["input_ids"])
 
-        # Combine
+        # Combine (order aligned with beast_calvin: image + task_prompt + text)
         task_prompt = self.prompt_embeds.expand(B, -1, -1)
-        merged = torch.cat([task_prompt, image_features, text_embeds], dim=1)
-        vis_mask = torch.ones(image_features.shape[:2], device=device)
-        prompt_mask = torch.ones(B, 1, dtype=torch.long, device=device)
-        attn_mask = torch.cat([prompt_mask, vis_mask, tokens["attention_mask"]], dim=1)
+        merged = torch.cat([image_features, task_prompt, text_embeds], dim=1)
+        prefix_mask = torch.ones(B, image_features.shape[1] + 1, device=device)
+        attn_mask = torch.cat([prefix_mask, tokens["attention_mask"]], dim=1)
 
         features = self.vlm.get_encoder()(
             inputs_embeds=merged, attention_mask=attn_mask
