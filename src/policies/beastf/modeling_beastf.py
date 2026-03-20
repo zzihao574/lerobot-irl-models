@@ -265,7 +265,6 @@ class BeastFModel(nn.Module):
         self.tokenizer = self.processor.tokenizer
         
         self.prompt_embeds = self._create_prompt_embed("<Primitives>").to(self.device)
-        self.vlm_vocab_size = self.vlm.language_model.get_output_embeddings().weight.shape[0] - 1
 
     def _setup_action_tokenizer(self, config: BeastVLAConfig) -> None:
         """
@@ -287,7 +286,8 @@ class BeastFModel(nn.Module):
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound
-        logger.info("Using tail-of-vocabulary mapping for BEAST action tokens.")
+        self.action_token_start_id = self.tokenizer.convert_tokens_to_ids("<loc_0>")
+        logger.info(f"Action tokens start at ID: {self.action_token_start_id}")
 
     def _create_prompt_embed(self, prompt_text: str) -> nn.Parameter:
         self.tokenizer.add_special_tokens({"additional_special_tokens": [prompt_text]})
@@ -307,11 +307,11 @@ class BeastFModel(nn.Module):
 
     def _bins_to_llm_ids(self, bin_ids: torch.Tensor) -> torch.Tensor:
         """Convert BeastTokenizer bins to VLM token IDs."""
-        return self.vlm_vocab_size - 1 - bin_ids
+        return bin_ids + self.action_token_start_id
 
     def _llm_ids_to_bins(self, llm_ids: torch.Tensor) -> torch.Tensor:
         """Convert VLM token IDs back to BeastTokenizer bins."""
-        bins = self.vlm_vocab_size - 1 - llm_ids
+        bins = llm_ids - self.action_token_start_id
         # Clamp to ensure validity during early training/sampling noise
         return torch.clamp(bins, 0, self.action_bins - 1)
 
@@ -399,14 +399,26 @@ class BeastFModel(nn.Module):
 
         # 3. Prepare Decoder Input
         B, SeqLen = llm_label_ids.shape
-        decoder_inputs = self._build_decoder_inputs(B, proprio=proprio)
-        
+        filler_bin = torch.full(
+            (B, SeqLen),
+            self.action_bins // 2,
+            dtype=torch.long,
+            device=self.device,
+        )
+        llm_input_ids = self._bins_to_llm_ids(filler_bin)
+
+        bidirectional_mask = create_bidirectional_mask(
+            batch_size=B,
+            seq_length=SeqLen,
+            device=self.device,
+        )
+
         # 4. Forward
         decoder_outputs = self.vlm.get_decoder()(
-            inputs_embeds=decoder_inputs["inputs_embeds"],
+            input_ids=llm_input_ids,
             encoder_hidden_states=features,
             encoder_attention_mask=encoder_attn_mask,
-            attention_mask=decoder_inputs["attention_mask"],
+            attention_mask=bidirectional_mask,
             use_cache=False,
         )
 
@@ -519,14 +531,21 @@ class BeastFModel(nn.Module):
         # 1. Construct Filler Input
         # We need (NumDOF * NumBasis) tokens
         seq_len_tokens = self.action_tokenizer.num_dof * self.action_tokenizer.num_basis
-        decoder_inputs = self._build_decoder_inputs(B, proprio=proprio)
+        filler_bin = torch.full(
+            (B, seq_len_tokens),
+            self.action_bins // 2,
+            dtype=torch.long,
+            device=self.device,
+        )
+        llm_input_ids = self._bins_to_llm_ids(filler_bin)
+        bidirectional_mask = create_bidirectional_mask(B, seq_len_tokens, self.device)
         
         # 2. Decode
         decoder_outputs = self.vlm.get_decoder()(
-            inputs_embeds=decoder_inputs["inputs_embeds"],
+            input_ids=llm_input_ids,
             encoder_hidden_states=features,
             encoder_attention_mask=mask,
-            attention_mask=decoder_inputs["attention_mask"],
+            attention_mask=bidirectional_mask,
             use_cache=False,
         )
         
