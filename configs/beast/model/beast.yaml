@@ -1,6 +1,6 @@
 _target_: policies.beastf.beastf_config.BeastVLAConfig
 
-use_amp: false
+use_amp: true
 normalization_mapping:
   VISUAL: IDENTITY
   STATE: MEAN_STD
@@ -15,17 +15,11 @@ prompt_robot_name: "Franka Panda"
 prompt_num_arms: 1
 prompt_action_space: "7 joint positions + 1 gripper width"
 prompt_include_meta: true
-image_resize_hw: null
-image_use_clip_normalization: false
-
-optimizer_lr: 2e-5
-optimizer_betas: [0.9, 0.999]
-optimizer_eps: 1e-8
-optimizer_weight_decay: 1e-4
-optimizer_grad_clip_norm: 10
-scheduler_warmup_steps: 1000
-scheduler_decay_steps: 40000
-scheduler_decay_lr: 3e-6
+image_resize_hw: [224, 224]
+image_use_clip_normalization: true
+use_random_shifts_aug: false
+random_shifts_pad_primary: 10
+random_shifts_pad_wrist: 4
 
 act_window_size: 16
 multistep: 16

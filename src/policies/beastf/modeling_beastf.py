@@ -12,7 +12,7 @@ from .beast_tokenizer.utils import discrete_to_continuous
 from .beastf_config import BeastVLAConfig
 # Assuming beast.py is in .beast_tokenizer package or similar
 from .beast_tokenizer.beast import BeastTokenizer
-from .beastf_utils import create_bidirectional_mask, token_prediction_accuracy
+from .beastf_utils import create_bidirectional_mask, token_prediction_accuracy, random_shifts_aug
 
 from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
 from lerobot.utils.constants import ACTION
@@ -216,6 +216,9 @@ class BeastFModel(nn.Module):
         self.image_use_clip_normalization = config.image_use_clip_normalization
         self.image_mean = tuple(CLIP_IMAGE_MEAN)
         self.image_std = tuple(CLIP_IMAGE_STD)
+        self.use_random_shifts_aug = config.use_random_shifts_aug
+        self.random_shifts_pad_primary = config.random_shifts_pad_primary
+        self.random_shifts_pad_wrist = config.random_shifts_pad_wrist
         self._logged_prompt_example = False
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
@@ -266,8 +269,8 @@ class BeastFModel(nn.Module):
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound
-        self.action_token_start_id = self.tokenizer.convert_tokens_to_ids("<loc_0>")
-        logger.info(f"Action tokens start at ID: {self.action_token_start_id}")
+        self.vlm_vocab_size = self.vlm.config.vocab_size - 1
+        logger.info(f"VLM vocab size for token mapping: {self.vlm_vocab_size}")
 
     def _build_prompt(self, instruction: str) -> str:
         """Build structured prompt from task instruction and robot metadata (aligned with beast_calvin)."""
@@ -295,13 +298,12 @@ class BeastFModel(nn.Module):
         self.action_tokenizer.to(self.device) # Ensure tokenizer buffers are on device
 
     def _bins_to_llm_ids(self, bin_ids: torch.Tensor) -> torch.Tensor:
-        """Convert BeastTokenizer bins to VLM token IDs."""
-        return bin_ids + self.action_token_start_id
+        """Convert BeastTokenizer bins to VLM token IDs (reversed mapping, aligned with source)."""
+        return self.vlm_vocab_size - 1 - bin_ids
 
     def _llm_ids_to_bins(self, llm_ids: torch.Tensor) -> torch.Tensor:
-        """Convert VLM token IDs back to BeastTokenizer bins."""
-        bins = llm_ids - self.action_token_start_id
-        # Clamp to ensure validity during early training/sampling noise
+        """Convert VLM token IDs back to BeastTokenizer bins (reversed mapping, aligned with source)."""
+        bins = self.vlm_vocab_size - 1 - llm_ids
         return torch.clamp(bins, 0, self.action_bins - 1)
 
     def _preprocess_images(
@@ -309,6 +311,7 @@ class BeastFModel(nn.Module):
         image_tensor: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        aug_pad: int = 0,
     ) -> torch.Tensor:
         image_tensor = image_tensor.to(device=device, dtype=dtype)
         if self.image_resize_hw is not None:
@@ -319,6 +322,8 @@ class BeastFModel(nn.Module):
                 align_corners=False,
                 antialias=True,
             )
+        if self.training and self.use_random_shifts_aug and aug_pad > 0:
+            image_tensor = random_shifts_aug(image_tensor, pad=aug_pad)
         if self.image_use_clip_normalization:
             mean = torch.tensor(self.image_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
             std = torch.tensor(self.image_std, device=device, dtype=dtype).view(1, -1, 1, 1)
@@ -454,6 +459,7 @@ class BeastFModel(nn.Module):
             image_tensor.reshape(-1, C, H, W),
             device=device,
             dtype=default_dtype,
+            aug_pad=self.random_shifts_pad_primary,
         )
         
         image_features = self.vlm._encode_image(
@@ -470,6 +476,7 @@ class BeastFModel(nn.Module):
                     img2.reshape(-1, C, H, W),
                     device=device,
                     dtype=default_dtype,
+                    aug_pad=self.random_shifts_pad_wrist,
                 )
             )
             feat2 = feat2.view(B, T * feat2.shape[1], -1)

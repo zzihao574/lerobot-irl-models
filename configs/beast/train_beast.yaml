@@ -28,3 +28,14 @@ train:
   output_dir: ${base_output_dir}/model_outputs
   job_name: "beast_${now:%Y-%m-%d}_${now:%H-%M-%S}"
   push_to_hub: false
+
+# Optimizer / Scheduler — overrides beast.yaml defaults
+model:
+  optimizer_lr: 2e-5
+  optimizer_betas: [0.9, 0.999]
+  optimizer_eps: 1e-8
+  optimizer_weight_decay: 1e-4
+  optimizer_grad_clip_norm: 10
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 40000
+  scheduler_decay_lr: 3e-6

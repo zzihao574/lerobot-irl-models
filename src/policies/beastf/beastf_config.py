@@ -57,6 +57,9 @@ class BeastVLAConfig(SmolVLAConfig):
     prompt_include_meta: bool = True
     image_resize_hw: tuple[int, int] | None = (224, 224)
     image_use_clip_normalization: bool = True
+    use_random_shifts_aug: bool = False
+    random_shifts_pad_primary: int = 10
+    random_shifts_pad_wrist: int = 4
     
     action_dim: int = 8
     act_window_size: int = 30
