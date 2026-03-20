@@ -77,6 +77,7 @@ class BeastVLAConfig(SmolVLAConfig):
     degree_p: int = 4
     action_bins: int = 256
     update_w_bound: bool = True
+    tokenizer_w_bound: float = 1.0
 
     return_act_chunk: bool = False
     use_action_scale: bool = False

@@ -89,17 +89,8 @@ class BeastVLAPolicy(PreTrainedPolicy):
         std = self.state_std.to(device=state_obs.device, dtype=state_obs.dtype)
         return state_obs * (std + 1e-8) + mean
 
-    def _normalize_action_targets(self, actions: torch.Tensor) -> torch.Tensor:
-        if self.action_mean is None or self.action_std is None:
-            raise RuntimeError("Missing action mean/std in dataset stats; cannot apply extra action normalization.")
-        mean = self.action_mean.to(device=actions.device, dtype=actions.dtype)
-        std = self.action_std.to(device=actions.device, dtype=actions.dtype)
-        return (actions - mean) / (std + 1e-8)
-
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        train_batch = dict(batch)
-        train_batch[ACTION] = self._normalize_action_targets(train_batch[ACTION])
-        result = self.model.forward(train_batch)
+        result = self.model.forward(batch)
         return result["loss"], result["loss_dict"]
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -274,6 +265,10 @@ class BeastFModel(nn.Module):
         # Note: config.action_bins should be in config (e.g., 256)
         self.action_bins = getattr(config, "action_bins", 256)
         
+        total_params = config.num_dof * config.num_basis
+        w_bound = getattr(config, "tokenizer_w_bound", 1.0)
+        w_min_init = -w_bound * torch.ones(total_params)
+        w_max_init = w_bound * torch.ones(total_params)
         self.action_tokenizer = BeastTokenizer(
             num_dof=config.num_dof,
             num_basis=config.num_basis,
@@ -283,6 +278,8 @@ class BeastFModel(nn.Module):
             gripper_zero_order=config.gripper_zero_order,
             gripper_dof=config.gripper_dof,
             enforce_init_pos=config.enforce_init_pos,
+            w_min=w_min_init,
+            w_max=w_max_init,
             device=self.device,
         )
         self.update_w_bound = config.update_w_bound
