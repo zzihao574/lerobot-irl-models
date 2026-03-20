@@ -38,8 +38,8 @@ num_dof: 8
 action_dim: 8
 gripper_dof: 1
 gripper_zero_order: False
-update_w_bound: false
-tokenizer_w_bound: 6.0
+update_w_bound: true
+tokenizer_w_bound: 1.0
 
 tokenizer_max_length: 128
 pad_language_to: "longest"

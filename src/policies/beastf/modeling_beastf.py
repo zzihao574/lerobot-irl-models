@@ -5,9 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
-from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.policies.pretrained import PreTrainedPolicy
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
+from transformers import AutoModelForCausalLM, AutoProcessor
 
 from .beast_tokenizer.utils import discrete_to_continuous
 from .beastf_config import BeastVLAConfig
@@ -64,16 +63,11 @@ class BeastVLAPolicy(PreTrainedPolicy):
         self.model = BeastFModel(config)
         self.model.reset()
 
-    def _get_norm_mode(self, feature_type: FeatureType) -> str:
-        mapping = self.config.normalization_mapping or {}
-        mode = mapping.get(feature_type)
-        if mode is None:
-            mode = mapping.get(feature_type.value, NormalizationMode.IDENTITY)
-        return getattr(mode, "value", str(mode))
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        result = self.model.forward(batch)
+        return result["loss"], result["loss_dict"]
 
     def _normalize_state_to_action_space(self, state_env: torch.Tensor) -> torch.Tensor:
-        if self._get_norm_mode(FeatureType.ACTION) == NormalizationMode.IDENTITY.value:
-            return state_env
         if self.action_mean is None or self.action_std is None:
             raise RuntimeError("Missing action mean/std in dataset stats; cannot build init_pos for first chunk.")
         mean = self.action_mean.to(device=state_env.device, dtype=state_env.dtype)
@@ -81,17 +75,11 @@ class BeastVLAPolicy(PreTrainedPolicy):
         return (state_env - mean) / (std + 1e-8)
 
     def _unnormalize_observation_state(self, state_obs: torch.Tensor) -> torch.Tensor:
-        if self._get_norm_mode(FeatureType.STATE) == NormalizationMode.IDENTITY.value:
-            return state_obs
         if self.state_mean is None or self.state_std is None:
             return state_obs
         mean = self.state_mean.to(device=state_obs.device, dtype=state_obs.dtype)
         std = self.state_std.to(device=state_obs.device, dtype=state_obs.dtype)
         return state_obs * (std + 1e-8) + mean
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        result = self.model.forward(batch)
-        return result["loss"], result["loss_dict"]
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
         return self.forward(batch)
@@ -231,26 +219,20 @@ class BeastFModel(nn.Module):
 
     def _setup_vlm(self, vlm_path, freeze_vision, freeze_florence, freeze_embed):
         logger.info(f"Loading VLM from {vlm_path}")
-
-        vlm_config = AutoConfig.from_pretrained(vlm_path, trust_remote_code=True)
-        vlm_config._attn_implementation = "eager"
-        if getattr(vlm_config, "text_config", None) is not None:
-            vlm_config.text_config._attn_implementation = "eager"
-
+        # Use old-style loading: simple from_pretrained without pre-modified config
         self.vlm = AutoModelForCausalLM.from_pretrained(
-            vlm_path,
-            config=vlm_config,
-            trust_remote_code=True,
-            attn_implementation="eager",
+            vlm_path, trust_remote_code=True, attn_implementation="eager"
         )
         
         if freeze_florence:
             for param in self.vlm.parameters(): param.requires_grad = False
-        else:
-            if freeze_embed:
-                for param in self.vlm.get_input_embeddings().parameters(): param.requires_grad = False
-            if freeze_vision:
-                for param in self.vlm.vision_tower.parameters(): param.requires_grad = False
+        elif freeze_embed:
+            for param in self.vlm.get_input_embeddings().parameters(): param.requires_grad = False
+
+        if freeze_florence and not freeze_vision:
+            for param in self.vlm.vision_tower.parameters(): param.requires_grad = True
+        elif not freeze_florence and freeze_vision:
+            for param in self.vlm.vision_tower.parameters(): param.requires_grad = False
 
         self.processor = AutoProcessor.from_pretrained(vlm_path, trust_remote_code=True)
         self.tokenizer = self.processor.tokenizer
@@ -554,7 +536,7 @@ class BeastFModel(nn.Module):
         pred_ids = torch.argmax(action_logits, dim=-1)
         pred_bins = self._llm_ids_to_bins(pred_ids)
         
-        #(optional) print continuous control point 
+        #(optional) Print continuous control point 
         control_points_flat = discrete_to_continuous(
             einops.rearrange(
                 pred_bins,
