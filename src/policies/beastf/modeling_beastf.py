@@ -24,6 +24,15 @@ CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 OBSERVATION_STATE = "observation.state"
 
 
+def _normalization_mode(mapping: dict[Any, Any] | None, feature: str, default: str = "IDENTITY") -> str:
+    if mapping is None:
+        return default
+    for key, value in mapping.items():
+        if str(getattr(key, "value", key)) == feature:
+            return str(getattr(value, "value", value))
+    return default
+
+
 class BeastVLAPolicy(PreTrainedPolicy):
     """
     BeastVLA Policy for LeRobot.
@@ -46,6 +55,10 @@ class BeastVLAPolicy(PreTrainedPolicy):
 
         self.action_mean = None
         self.action_std = None
+        self.action_norm_mode = _normalization_mode(
+            getattr(config, "normalization_mapping", None),
+            "ACTION",
+        )
         if dataset_stats is not None and ACTION in dataset_stats:
             action_stats = dataset_stats[ACTION]
             if "mean" in action_stats and "std" in action_stats:
@@ -54,6 +67,10 @@ class BeastVLAPolicy(PreTrainedPolicy):
 
         self.state_mean = None
         self.state_std = None
+        self.state_norm_mode = _normalization_mode(
+            getattr(config, "normalization_mapping", None),
+            "STATE",
+        )
         if dataset_stats is not None and OBSERVATION_STATE in dataset_stats:
             state_stats = dataset_stats[OBSERVATION_STATE]
             if "mean" in state_stats and "std" in state_stats:
@@ -68,15 +85,27 @@ class BeastVLAPolicy(PreTrainedPolicy):
         return result["loss"], result["loss_dict"]
 
     def _normalize_state_to_action_space(self, state_env: torch.Tensor) -> torch.Tensor:
+        if self.action_norm_mode == "IDENTITY":
+            return state_env
+        if self.action_norm_mode != "MEAN_STD":
+            raise RuntimeError(
+                f"Unsupported ACTION normalization mode: {self.action_norm_mode}"
+            )
         if self.action_mean is None or self.action_std is None:
-            raise RuntimeError("Missing action mean/std in dataset stats; cannot build init_pos for first chunk.")
+            raise RuntimeError(
+                "ACTION normalization is MEAN_STD, but action mean/std are missing."
+            )
         mean = self.action_mean.to(device=state_env.device, dtype=state_env.dtype)
         std = self.action_std.to(device=state_env.device, dtype=state_env.dtype)
         return (state_env - mean) / (std + 1e-8)
 
     def _unnormalize_observation_state(self, state_obs: torch.Tensor) -> torch.Tensor:
-        if self.state_mean is None or self.state_std is None:
+        if self.state_norm_mode != "MEAN_STD":
             return state_obs
+        if self.state_mean is None or self.state_std is None:
+            raise RuntimeError(
+                "STATE normalization is MEAN_STD, but observation.state mean/std are missing."
+            )
         mean = self.state_mean.to(device=state_obs.device, dtype=state_obs.dtype)
         std = self.state_std.to(device=state_obs.device, dtype=state_obs.dtype)
         return state_obs * (std + 1e-8) + mean
